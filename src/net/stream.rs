@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_rustls::client::TlsStream;
 
 /// A stream that might be protected with TLS.
 #[derive(Debug)]
@@ -12,7 +13,7 @@ pub enum MaybeTlsStream<S> {
     /// Unencrypted socket stream.
     Plain(S),
     /// Encrypted socket stream using `rustls`.
-    Rustls(tokio_rustls::client::TlsStream<S>),
+    Rustls(Box<TlsStream<S>>),
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeTlsStream<S> {

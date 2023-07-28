@@ -142,7 +142,7 @@ impl Client {
 
     pub async fn status(&self) -> Status {
         let status = self.status.lock().await;
-        status.clone()
+        *status
     }
 
     async fn set_status(&self, status: Status) {
@@ -375,9 +375,9 @@ impl Client {
         Ok(())
     }
 
-    /* /// Disconnect from relay and set status to 'Stopped'
+    /// Disconnect from relay and set status to 'Stopped'
     pub async fn stop(&self) -> Result<(), Error> {
-        self.schedule_for_stop(true);
+        //self.schedule_for_stop(true);
         let status = self.status().await;
         if status.ne(&Status::Disconnected)
             && status.ne(&Status::Stopped)
@@ -390,7 +390,7 @@ impl Client {
 
     /// Disconnect from relay and set status to 'Terminated'
     pub async fn terminate(&self) -> Result<(), Error> {
-        self.schedule_for_termination(true);
+        //self.schedule_for_termination(true);
         let status = self.status().await;
         if status.ne(&Status::Disconnected)
             && status.ne(&Status::Stopped)
@@ -399,7 +399,7 @@ impl Client {
             self.send_client_event(ClientEvent::Terminate, None)?;
         }
         Ok(())
-    } */
+    }
 
     pub async fn send_msg(&self, msg: Request, wait: Option<Duration>) -> Result<(), Error> {
         match wait {

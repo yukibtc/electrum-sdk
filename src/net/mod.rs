@@ -77,9 +77,9 @@ where
         .map_err(|_| Error::Timeout)??;
 
     if ssl {
-        Ok(MaybeTlsStream::Rustls(
+        Ok(MaybeTlsStream::Rustls(Box::new(
             connect_with_tls(addr.domain().ok_or(Error::InvalidDNSName)?, stream).await?,
-        ))
+        )))
     } else {
         Ok(MaybeTlsStream::Plain(stream))
     }
@@ -100,9 +100,9 @@ where
         .map_err(|_| Error::Timeout)??;
 
     if ssl {
-        Ok(MaybeTlsStream::Rustls(
+        Ok(MaybeTlsStream::Rustls(Box::new(
             connect_with_tls(addr.domain().ok_or(Error::InvalidDNSName)?, stream).await?,
-        ))
+        )))
     } else {
         Ok(MaybeTlsStream::Plain(stream))
     }
