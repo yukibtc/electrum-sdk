@@ -12,17 +12,47 @@ use bitcoin::hashes::{sha256, Hash};
 use bitcoin::{Script, Txid};
 use serde::{de, Deserialize, Serialize};
 use serde_json::Value;
-
-use crate::error::Error;
+use thiserror::Error;
 
 static JSONRPC_2_0: &str = "2.0";
 
-pub type Call = (String, Vec<Param>);
+//pub type Call = (String, Vec<Param>);
 
-#[derive(Debug, Clone, Serialize)]
+/// Errors
+#[derive(Debug, Error)]
+pub enum Error {
+    /// Wraps `std::io::Error`
+    #[error(transparent)]
+    IO(#[from] std::io::Error),
+    /// Wraps `serde_json::error::Error`
+    #[error(transparent)]
+    JSON(#[from] serde_json::error::Error),
+    /// Wraps `bitcoin::hashes::hex::Error`
+    #[error(transparent)]
+    Hex(#[from] bitcoin::hashes::hex::Error),
+    /// Error during the deserialization of a Bitcoin data structure
+    #[error(transparent)]
+    Bitcoin(#[from] bitcoin::consensus::encode::Error),
+    /// Error returned by the Electrum server
+    #[error("Electrum server error: {0}")]
+    Protocol(serde_json::Value),
+    /// Already subscribed to the notifications of an address
+    #[error("Already subscribed to the notifications of an address")]
+    AlreadySubscribed(ScriptHash),
+    /// Not subscribed to the notifications of an address
+    #[error("Not subscribed to the notifications of an address")]
+    NotSubscribed(ScriptHash),
+    /// Error during the deserialization of a response from the server
+    #[error("Error during the deserialization of a response from the server: {0}")]
+    InvalidResponse(serde_json::Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 /// A single parameter of a [`Request`](struct.Request.html)
 pub enum Param {
+    /// Integer parameter
+    U8(u8),
     /// Integer parameter
     U32(u32),
     /// Integer parameter
@@ -35,31 +65,75 @@ pub enum Param {
     Bytes(Vec<u8>),
 }
 
-#[derive(Debug, Clone, Serialize)]
-/// A request that can be sent to the server
-pub struct Request {
-    /// JSON-RPC version
-    pub jsonrpc: String,
-    /// The JSON-RPC request id
-    pub id: usize,
-    /// The request method
-    pub method: String,
-    /// The request parameters
-    pub params: Vec<Param>,
+/// Request
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Request {
+    GetBlockHeader { height: usize },
+    EstimateFee { blocks: u8 },
 }
 
 impl Request {
-    /// Creates a new request with a default id
-    pub fn new<S>(id: usize, method: S, params: Vec<Param>) -> Self
+    /// Get req method
+    pub fn method(&self) -> String {
+        match self {
+            Self::GetBlockHeader { .. } => "blockchain.block.header".to_string(),
+            Self::EstimateFee { .. } => "blockchain.estimatefee".to_string(),
+        }
+    }
+
+    /// Get req params
+    pub fn params(&self) -> Vec<Param> {
+        match self {
+            Self::GetBlockHeader { height } => vec![Param::Usize(*height)],
+            Self::EstimateFee { blocks } => vec![Param::U8(*blocks)],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonRpcMsg {
+    /// Request
+    Request {
+        /// Request id
+        id: usize,
+        /// JSON-RPC version
+        jsonrpc: String,
+        /// Method
+        method: String,
+        /// params
+        params: Vec<Param>,
+    },
+    /// Response
+    Response {
+        /// Request id
+        id: usize,
+        /// JSON-RPC version
+        jsonrpc: String,
+        /// Result
+        result: Option<Value>,
+        /// Reason, if failed
+        error: Option<String>,
+    },
+}
+
+impl JsonRpcMsg {
+    /// Compose `Request` message
+    pub fn request(id: usize, req: Request) -> Self {
+        Self::Request {
+            id,
+            jsonrpc: JSONRPC_2_0.to_string(),
+            method: req.method(),
+            params: req.params(),
+        }
+    }
+
+    /// Deserialize from JSON string
+    pub fn from_json<S>(json: S) -> Result<Self, Error>
     where
         S: Into<String>,
     {
-        Self {
-            id,
-            jsonrpc: JSONRPC_2_0.to_string(),
-            method: method.into(),
-            params,
-        }
+        Ok(serde_json::from_str(&json.into())?)
     }
 
     /// Serialize as JSON
@@ -73,28 +147,16 @@ impl Request {
         bytes.extend_from_slice(b"\n");
         Ok(bytes)
     }
-}
 
-/// Response
-#[derive(Debug, Clone, Deserialize)]
-pub struct Response {
-    /// JSON-RPC version
-    pub jsonrpc: String,
-    /// The JSON-RPC request id
-    pub id: usize,
-    /// Result
-    pub result: Option<Value>,
-    /// Error
-    pub error: Option<Value>,
-}
+    pub fn id(&self) -> usize {
+        match self {
+            Self::Request { id, .. } => *id,
+            Self::Response { id, .. } => *id,
+        }
+    }
 
-impl Response {
-    /// Deserialize from JSON string
-    pub fn from_json<S>(json: S) -> Result<Self, Error>
-    where
-        S: Into<String>,
-    {
-        Ok(serde_json::from_str(&json.into())?)
+    pub fn is_request(&self) -> bool {
+        matches!(self, Self::Request { .. })
     }
 }
 

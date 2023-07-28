@@ -11,6 +11,9 @@ async fn main() {
 
     client.connect(true).await;
 
+    let header = client.block_header(800_000).await.unwrap();
+    println!("{}", header.block_hash());
+
     let res = client.estimate_fee(6).await;
     println!("{:#?}", res);
 }
