@@ -14,17 +14,17 @@ use async_utility::{thread, time};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::{BlockHeader, Script, Transaction, Txid};
-use crossbeam_channel::{bounded, Receiver as CbReceiver, RecvTimeoutError, Sender as CbSender};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::oneshot;
 use tokio::sync::Mutex;
+use tokio::sync::{broadcast, oneshot};
 
 use crate::net;
 use crate::types::{
     GetBalanceRes, GetHeadersRes, GetHistoryRes, GetMerkleRes, HeaderNotification, JsonRpcMsg,
-    ListUnspentRes, Param, RawHeaderNotification, Request, ScriptStatus, ServerFeaturesRes,
+    ListUnspentRes, Param, RawHeaderNotification, Request, Response, ScriptStatus,
+    ServerFeaturesRes,
 };
 
 type Message = (ClientEvent, Option<oneshot::Sender<bool>>);
@@ -37,9 +37,6 @@ pub enum Error {
     /// Message response timeout
     #[error("recv message response timeout")]
     RecvTimeout,
-    ///
-    #[error(transparent)]
-    CbRecvTimeout(#[from] RecvTimeoutError),
     /// Generic timeout
     #[error("timeout")]
     Timeout,
@@ -49,6 +46,9 @@ pub enum Error {
     /// Impossible to receive oneshot message
     #[error("impossible to recv msg")]
     OneShotRecvError,
+    /// Invalid response
+    #[error("invalid response")]
+    InvalidResponse,
 }
 
 /// Client connection status
@@ -89,19 +89,17 @@ pub enum ClientEvent {
     Terminate,
 }
 
+/// Client notification
 #[derive(Debug, Clone)]
-pub struct ClientChannels {
-    header: (CbSender<BlockHeader>, CbReceiver<BlockHeader>),
-    estimate_fee: (CbSender<f64>, CbReceiver<f64>),
-}
-
-impl Default for ClientChannels {
-    fn default() -> Self {
-        Self {
-            header: bounded::<BlockHeader>(1),
-            estimate_fee: bounded::<f64>(1),
-        }
-    }
+pub enum Notification {
+    Response {
+        id: usize,
+        response: Response,
+    },
+    /// Stop
+    Stop,
+    /// Shutdown
+    Shutdown,
 }
 
 /// Electrum Client
@@ -111,10 +109,10 @@ pub struct Client {
     proxy: Option<SocketAddr>,
     status: Arc<Mutex<Status>>,
     last_id: Arc<AtomicUsize>,
-    channels: ClientChannels,
+    inventory: Arc<Mutex<HashMap<usize, Request>>>,
     sender: Sender<Message>,
     receiver: Arc<Mutex<Receiver<Message>>>,
-    inventory: Arc<Mutex<HashMap<usize, String>>>,
+    notifications: broadcast::Sender<Notification>,
 }
 
 impl Client {
@@ -124,16 +122,17 @@ impl Client {
         S: Into<String>,
     {
         let (sender, receiver) = mpsc::channel::<Message>(1024);
+        let (tx, _) = broadcast::channel::<Notification>(1024);
 
         Self {
             addr: addr.into(),
             proxy,
             status: Arc::new(Mutex::new(Status::default())),
             last_id: Arc::new(AtomicUsize::new(0)),
-            channels: ClientChannels::default(),
+            inventory: Arc::new(Mutex::new(HashMap::new())),
             sender,
             receiver: Arc::new(Mutex::new(receiver)),
-            inventory: Arc::new(Mutex::new(HashMap::new())),
+            notifications: tx,
         }
     }
     pub fn addr(&self) -> String {
@@ -142,6 +141,10 @@ impl Client {
 
     pub fn proxy(&self) -> Option<SocketAddr> {
         self.proxy
+    }
+
+    pub fn notifications(&self) -> broadcast::Receiver<Notification> {
+        self.notifications.subscribe()
     }
 
     pub async fn status(&self) -> Status {
@@ -304,13 +307,11 @@ impl Client {
                     loop {
                         data.clear();
 
-                        reader.read_line(&mut data).await.unwrap();
-
-                        match JsonRpcMsg::from_json(&data) {
-                            Ok(msg) => {
-                                if let JsonRpcMsg::Response {
+                        match reader.read_line(&mut data).await {
+                            Ok(_) => {
+                                if let Ok(JsonRpcMsg::Response {
                                     id, result, error, ..
-                                } = msg
+                                }) = JsonRpcMsg::from_json(&data)
                                 {
                                     log::trace!("Received response: {data}");
 
@@ -321,38 +322,54 @@ impl Client {
                                         inventory.remove(&id);
                                     } else if let Some(result) = result {
                                         match inventory.get(&id) {
-                                            Some(method) => match method.as_str() {
-                                                "blockchain.block.header" => {
+                                            Some(req) => match req {
+                                                Request::GetBlockHeader { .. } => {
                                                     let data = Vec::<u8>::from_hex(
                                                         result.as_str().unwrap(),
                                                     )
                                                     .unwrap();
                                                     let header: BlockHeader =
                                                         deserialize(&data).unwrap();
-                                                    client.channels.header.0.send(header).unwrap();
+                                                    client
+                                                        .notifications
+                                                        .send(Notification::Response {
+                                                            id,
+                                                            response: Response::BlockHeader(header),
+                                                        })
+                                                        .unwrap();
                                                 }
-                                                "blockchain.estimatefee" => {
+                                                Request::BlockHeaderSubscribe => {
+                                                    let notifications = serde_json::from_value::<
+                                                        RawHeaderNotification,
+                                                    >(
+                                                        result
+                                                    )
+                                                    .unwrap();
+                                                    println!("{notifications:?}");
+                                                    // TODO: send global notification
+                                                }
+                                                Request::EstimateFee { .. } => {
                                                     let fee: f64 =
                                                         serde_json::from_value(result).unwrap();
                                                     client
-                                                        .channels
-                                                        .estimate_fee
-                                                        .0
-                                                        .send(fee)
+                                                        .notifications
+                                                        .send(Notification::Response {
+                                                            id,
+                                                            response: Response::EstimateFee(fee),
+                                                        })
                                                         .unwrap();
                                                 }
-                                                _ => log::warn!("NOT IMPLEMENTED"),
                                             },
                                             None => log::error!("ID not found in inventory"),
                                         }
                                     }
-                                }
+                                };
                             }
-                            Err(err) => {
-                                log::error!("{err}");
+                            Err(e) => {
+                                log::error!("Impossible to read line: {e}");
                                 break;
                             }
-                        };
+                        }
                     }
 
                     log::debug!("Exited from Message Thread of {}", client.addr);
@@ -417,13 +434,13 @@ impl Client {
         Ok(())
     }
 
-    pub async fn send_msg(&self, req: Request, wait: Option<Duration>) -> Result<(), Error> {
+    pub async fn send_msg(&self, req: Request, wait: Option<Duration>) -> Result<usize, Error> {
         let next_id = self.last_id.fetch_add(1, Ordering::SeqCst);
         let msg = JsonRpcMsg::request(next_id, req.clone());
 
         {
             let mut inventory = self.inventory.lock().await;
-            inventory.insert(msg.id(), req.method());
+            inventory.insert(msg.id(), req);
         }
 
         match wait {
@@ -434,7 +451,7 @@ impl Client {
                     Some(result) => match result {
                         Ok(val) => {
                             if val {
-                                Ok(())
+                                Ok(next_id)
                             } else {
                                 Err(Error::MessageNotSent)
                             }
@@ -444,38 +461,64 @@ impl Client {
                     _ => Err(Error::RecvTimeout),
                 }
             }
-            None => self.send_client_event(ClientEvent::SendMsg(msg), None),
+            None => {
+                self.send_client_event(ClientEvent::SendMsg(msg), None)?;
+                Ok(next_id)
+            }
         }
+    }
+
+    async fn get_response(
+        &self,
+        msg_id: usize,
+        timeout: Option<Duration>,
+    ) -> Result<Option<Response>, Error> {
+        let mut notifications = self.notifications.subscribe();
+        time::timeout(timeout, async {
+            while let Ok(notification) = notifications.recv().await {
+                if let Notification::Response { id, response } = notification {
+                    if msg_id == id {
+                        return Some(response);
+                    }
+                }
+            }
+
+            None
+        })
+        .await
+        .ok_or(Error::Timeout)
     }
 }
 
 impl Client {
     pub async fn block_header(&self, height: usize) -> Result<BlockHeader, Error> {
         let req = Request::GetBlockHeader { height };
+        let id = self.send_msg(req, Some(Duration::from_secs(30))).await?;
+        let res = self.get_response(id, Some(Duration::from_secs(30))).await?;
+        match res {
+            Some(Response::BlockHeader(header)) => Ok(header),
+            _ => Err(Error::InvalidResponse),
+        }
+    }
+
+    pub async fn block_headers_subscribe(&self) -> Result<(), Error> {
+        let req = Request::BlockHeaderSubscribe;
         self.send_msg(req, Some(Duration::from_secs(30))).await?;
-        Ok(self
-            .channels
-            .header
-            .1
-            .recv_timeout(Duration::from_secs(30))?)
+        Ok(())
     }
 
     pub async fn estimate_fee(&self, blocks: u8) -> Result<f64, Error> {
         let req = Request::EstimateFee { blocks };
-        self.send_msg(req, Some(Duration::from_secs(30))).await?;
-        Ok(self
-            .channels
-            .estimate_fee
-            .1
-            .recv_timeout(Duration::from_secs(30))?)
+        let id = self.send_msg(req, Some(Duration::from_secs(30))).await?;
+        let res = self.get_response(id, Some(Duration::from_secs(30))).await?;
+        match res {
+            Some(Response::EstimateFee(fee)) => Ok(fee),
+            _ => Err(Error::InvalidResponse),
+        }
     }
 }
 
 /*
-/// Gets the block header for height `height`.
-    fn block_header(&self, height: usize) -> Result<BlockHeader, Error> {
-        Ok(deserialize(&self.block_header_raw(height)?)?)
-    }
 
     /// Subscribes to notifications for new block headers, by sending a `blockchain.headers.subscribe` call.
     fn block_headers_subscribe(&self) -> Result<HeaderNotification, Error> {
