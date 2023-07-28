@@ -221,6 +221,19 @@ impl Client {
                 log::info!("Connected to {}", addr);
 
                 let client = self.clone();
+                let pinger = thread::abortable(async move {
+                    log::debug!("Client Pinger Thread Started");
+
+                    loop {
+                        thread::sleep(Duration::from_secs(45)).await;
+
+                        if let Err(e) = client.ping().await {
+                            log::error!("Impossible to ping: {e}");
+                        }
+                    }
+                });
+
+                let client = self.clone();
                 thread::spawn(async move {
                     log::debug!("Client Sender Thread Started");
                     let mut rx = client.receiver.lock().await;
@@ -295,6 +308,9 @@ impl Client {
                             }
                         }
                     }
+
+                    pinger.abort();
+
                     log::debug!("Exited from Client Event Thread");
                 });
 
@@ -308,62 +324,76 @@ impl Client {
                         data.clear();
 
                         match reader.read_line(&mut data).await {
-                            Ok(_) => {
-                                if let Ok(JsonRpcMsg::Response {
-                                    id, result, error, ..
-                                }) = JsonRpcMsg::from_json(&data)
-                                {
-                                    log::trace!("Received response: {data}");
+                            Ok(size) => {
+                                if size > 0 {
+                                    match JsonRpcMsg::from_json(&data) {
+                                        Ok(JsonRpcMsg::Response {
+                                            id, result, error, ..
+                                        }) => {
+                                            log::trace!("Received response: {data}");
 
-                                    let mut inventory = client.inventory.lock().await;
+                                            let mut inventory = client.inventory.lock().await;
 
-                                    if let Some(e) = error {
-                                        log::error!("Received error: {e}");
-                                        inventory.remove(&id);
-                                    } else if let Some(result) = result {
-                                        match inventory.get(&id) {
-                                            Some(req) => match req {
-                                                Request::GetBlockHeader { .. } => {
-                                                    let data = Vec::<u8>::from_hex(
-                                                        result.as_str().unwrap(),
-                                                    )
-                                                    .unwrap();
-                                                    let header: BlockHeader =
-                                                        deserialize(&data).unwrap();
-                                                    client
-                                                        .notifications
-                                                        .send(Notification::Response {
-                                                            id,
-                                                            response: Response::BlockHeader(header),
-                                                        })
-                                                        .unwrap();
+                                            if let Some(e) = error {
+                                                log::error!("Received error: {e}");
+                                                inventory.remove(&id);
+                                            } else if let Some(result) = result {
+                                                match inventory.get(&id) {
+                                                    Some(req) => match req {
+                                                        Request::GetBlockHeader { .. } => {
+                                                            let data = Vec::<u8>::from_hex(
+                                                                result.as_str().unwrap(),
+                                                            )
+                                                            .unwrap();
+                                                            let header: BlockHeader =
+                                                                deserialize(&data).unwrap();
+                                                            client
+                                                                .notifications
+                                                                .send(Notification::Response {
+                                                                    id,
+                                                                    response: Response::BlockHeader(
+                                                                        header,
+                                                                    ),
+                                                                })
+                                                                .unwrap();
+                                                        }
+                                                        Request::BlockHeaderSubscribe => {
+                                                            let notifications: RawHeaderNotification =
+                                                                serde_json::from_value(result).unwrap();
+                                                            println!("{notifications:?}");
+                                                            // TODO: send global notification
+                                                        }
+                                                        Request::EstimateFee { .. } => {
+                                                            let fee: f64 =
+                                                                serde_json::from_value(result)
+                                                                    .unwrap();
+                                                            client
+                                                                .notifications
+                                                                .send(Notification::Response {
+                                                                    id,
+                                                                    response: Response::EstimateFee(
+                                                                        fee,
+                                                                    ),
+                                                                })
+                                                                .unwrap();
+                                                        }
+                                                        _ => (),
+                                                    },
+                                                    None => {
+                                                        log::error!("ID not found in inventory")
+                                                    }
                                                 }
-                                                Request::BlockHeaderSubscribe => {
-                                                    let notifications = serde_json::from_value::<
-                                                        RawHeaderNotification,
-                                                    >(
-                                                        result
-                                                    )
-                                                    .unwrap();
-                                                    println!("{notifications:?}");
-                                                    // TODO: send global notification
-                                                }
-                                                Request::EstimateFee { .. } => {
-                                                    let fee: f64 =
-                                                        serde_json::from_value(result).unwrap();
-                                                    client
-                                                        .notifications
-                                                        .send(Notification::Response {
-                                                            id,
-                                                            response: Response::EstimateFee(fee),
-                                                        })
-                                                        .unwrap();
-                                                }
-                                            },
-                                            None => log::error!("ID not found in inventory"),
+                                            }
                                         }
-                                    }
-                                };
+                                        Err(e) => {
+                                            log::error!("{e}: {data}");
+                                        }
+                                        _ => log::warn!("Received unexpected msg: {data}"),
+                                    };
+                                } else {
+                                    log::error!("Stream has reached EOF");
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 log::error!("Impossible to read line: {e}");
@@ -378,6 +408,10 @@ impl Client {
                         log::error!("Impossible to disconnect {}: {}", client.addr, err);
                     }
                 });
+
+                /* if let Err(e) = self.version().await {
+                    log::error!("Impossible to send version: {e}");
+                } */
             }
             Err(err) => {
                 self.set_status(Status::Disconnected).await;
@@ -491,6 +525,21 @@ impl Client {
 }
 
 impl Client {
+    async fn version(&self) -> Result<(), Error> {
+        let req = Request::Version {
+            name: String::from("Electrum SDK"),
+            version: 1.4,
+        };
+        self.send_msg(req, Some(Duration::from_secs(30))).await?;
+        Ok(())
+    }
+
+    async fn ping(&self) -> Result<(), Error> {
+        let req = Request::Ping;
+        self.send_msg(req, Some(Duration::from_secs(30))).await?;
+        Ok(())
+    }
+
     pub async fn block_header(&self, height: usize) -> Result<BlockHeader, Error> {
         let req = Request::GetBlockHeader { height };
         let id = self.send_msg(req, Some(Duration::from_secs(30))).await?;

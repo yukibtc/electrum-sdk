@@ -66,11 +66,13 @@ pub enum Param {
 }
 
 /// Request
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum Request {
     GetBlockHeader { height: usize },
     BlockHeaderSubscribe,
     EstimateFee { blocks: u8 },
+    Version { name: String, version: f32 },
+    Ping,
 }
 
 impl Request {
@@ -80,6 +82,8 @@ impl Request {
             Self::GetBlockHeader { .. } => "blockchain.block.header".to_string(),
             Self::BlockHeaderSubscribe => "blockchain.headers.subscribe".to_string(),
             Self::EstimateFee { .. } => "blockchain.estimatefee".to_string(),
+            Self::Version { .. } => "server.version".to_string(),
+            Self::Ping => "server.ping".to_string(),
         }
     }
 
@@ -89,6 +93,11 @@ impl Request {
             Self::GetBlockHeader { height } => vec![Param::Usize(*height)],
             Self::BlockHeaderSubscribe => Vec::new(),
             Self::EstimateFee { blocks } => vec![Param::U8(*blocks)],
+            Self::Version { name, version } => vec![
+                Param::String(name.clone()),
+                Param::String(version.to_string()),
+            ],
+            Self::Ping => Vec::new(),
         }
     }
 }
