@@ -1,9 +1,11 @@
-extern crate electrum_client;
+// Copyright (c) 2023 Yuki Kishimoto
+// Distributed under the MIT software license
 
-use electrum_client::{Client, ElectrumApi};
+use electrum_sdk::Client;
 
-fn main() {
-    let client = Client::new("ssl://electrum.blockstream.info:50002").unwrap();
-    let res = client.server_features();
+#[tokio::main]
+async fn main() {
+    let client = Client::new("ssl://electrum.blockstream.info:50002", None);
+    let res = client.estimate_fee(6).await;
     println!("{:#?}", res);
 }

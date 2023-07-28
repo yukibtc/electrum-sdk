@@ -1,3 +1,6 @@
+// Copyright (c) 2023 Yuki Kishimoto
+// Distributed under the MIT software license
+
 //! Electrum APIs
 
 use std::convert::TryInto;
@@ -5,8 +8,8 @@ use std::convert::TryInto;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::{BlockHeader, Script, Transaction, Txid};
 
-use batch::Batch;
-use types::*;
+use crate::batch::Batch;
+use crate::{types::*, Error};
 
 /// API calls exposed by an Electrum client
 pub trait ElectrumApi {

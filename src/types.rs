@@ -3,23 +3,23 @@
 //! This module contains definitions of all the complex data structures that are returned by calls
 
 use std::convert::TryFrom;
-use std::fmt::{self, Display, Formatter};
 use std::ops::Deref;
-use std::sync::Arc;
 
 use bitcoin::blockdata::block;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::{Script, Txid};
-
 use serde::{de, Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::error::Error;
 
 static JSONRPC_2_0: &str = "2.0";
 
 pub type Call = (String, Vec<Param>);
 
-#[derive(Serialize, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 /// A single parameter of a [`Request`](struct.Request.html)
 pub enum Param {
@@ -35,36 +35,66 @@ pub enum Param {
     Bytes(Vec<u8>),
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Debug, Clone, Serialize)]
 /// A request that can be sent to the server
-pub struct Request<'a> {
-    jsonrpc: &'static str,
-
+pub struct Request {
+    /// JSON-RPC version
+    pub jsonrpc: String,
     /// The JSON-RPC request id
     pub id: usize,
     /// The request method
-    pub method: &'a str,
+    pub method: String,
     /// The request parameters
     pub params: Vec<Param>,
 }
 
-impl<'a> Request<'a> {
+impl Request {
     /// Creates a new request with a default id
-    fn new(method: &'a str, params: Vec<Param>) -> Self {
+    pub fn new<S>(id: usize, method: S, params: Vec<Param>) -> Self
+    where
+        S: Into<String>,
+    {
         Self {
-            id: 0,
-            jsonrpc: JSONRPC_2_0,
-            method,
+            id,
+            jsonrpc: JSONRPC_2_0.to_string(),
+            method: method.into(),
             params,
         }
     }
 
-    /// Creates a new request with a user-specified id
-    pub fn new_id(id: usize, method: &'a str, params: Vec<Param>) -> Self {
-        let mut instance = Self::new(method, params);
-        instance.id = id;
+    /// Serialize as JSON
+    pub fn as_json(&self) -> String {
+        serde_json::json!(self).to_string()
+    }
 
-        instance
+    /// Serialize as bytes
+    pub fn as_bytes(&self) -> Result<Vec<u8>, Error> {
+        let mut bytes = serde_json::to_vec(self)?;
+        bytes.extend_from_slice(b"\n");
+        Ok(bytes)
+    }
+}
+
+/// Response
+#[derive(Debug, Clone, Deserialize)]
+pub struct Response {
+    /// JSON-RPC version
+    pub jsonrpc: String,
+    /// The JSON-RPC request id
+    pub id: usize,
+    /// Result
+    pub result: Option<Value>,
+    /// Error
+    pub error: Option<Value>,
+}
+
+impl Response {
+    /// Deserialize from JSON string
+    pub fn from_json<S>(json: S) -> Result<Self, Error>
+    where
+        S: Into<String>,
+    {
+        Ok(serde_json::from_str(&json.into())?)
     }
 }
 
@@ -265,126 +295,4 @@ pub struct ScriptNotification {
     pub scripthash: ScriptHash,
     /// The new status of the address.
     pub status: ScriptStatus,
-}
-
-/// Errors
-#[derive(Debug)]
-pub enum Error {
-    /// Wraps `std::io::Error`
-    IOError(std::io::Error),
-    /// Wraps `serde_json::error::Error`
-    JSON(serde_json::error::Error),
-    /// Wraps `bitcoin::hashes::hex::Error`
-    Hex(bitcoin::hashes::hex::Error),
-    /// Error returned by the Electrum server
-    Protocol(serde_json::Value),
-    /// Error during the deserialization of a Bitcoin data structure
-    Bitcoin(bitcoin::consensus::encode::Error),
-    /// Already subscribed to the notifications of an address
-    AlreadySubscribed(ScriptHash),
-    /// Not subscribed to the notifications of an address
-    NotSubscribed(ScriptHash),
-    /// Error during the deserialization of a response from the server
-    InvalidResponse(serde_json::Value),
-    /// Generic error with a message
-    Message(String),
-    /// Invalid domain name for an SSL certificate
-    InvalidDNSNameError(String),
-    /// Missing domain while it was explicitly asked to validate it
-    MissingDomain,
-    /// Made one or multiple attempts, always in Error
-    AllAttemptsErrored(Vec<Error>),
-    /// There was an io error reading the socket, to be shared between threads
-    SharedIOError(Arc<std::io::Error>),
-
-    /// Couldn't take a lock on the reader mutex. This means that there's already another reader
-    /// thread running
-    CouldntLockReader,
-    /// Broken IPC communication channel: the other thread probably has exited
-    Mpsc,
-
-    #[cfg(feature = "use-rustls")]
-    /// Could not create a rustls client connection
-    CouldNotCreateConnection(rustls::Error),
-
-    #[cfg(feature = "use-openssl")]
-    /// Invalid OpenSSL method used
-    InvalidSslMethod(openssl::error::ErrorStack),
-    #[cfg(feature = "use-openssl")]
-    /// SSL Handshake failed with the server
-    SslHandshakeError(openssl::ssl::HandshakeError<std::net::TcpStream>),
-}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::IOError(e) => Display::fmt(e, f),
-            Error::JSON(e) => Display::fmt(e, f),
-            Error::Hex(e) => Display::fmt(e, f),
-            Error::Bitcoin(e) => Display::fmt(e, f),
-            Error::SharedIOError(e) => Display::fmt(e, f),
-            #[cfg(feature = "use-openssl")]
-            Error::SslHandshakeError(e) => Display::fmt(e, f),
-            #[cfg(feature = "use-openssl")]
-            Error::InvalidSslMethod(e) => Display::fmt(e, f),
-            #[cfg(feature = "use-rustls")]
-            Error::CouldNotCreateConnection(e) => Display::fmt(e, f),
-
-            Error::Message(e) => f.write_str(e),
-            Error::InvalidDNSNameError(domain) => write!(f, "Invalid domain name {} not matching SSL certificate", domain),
-            Error::AllAttemptsErrored(errors) => {
-                f.write_str("Made one or multiple attempts, all errored:\n")?;
-                for err in errors {
-                    writeln!(f, "\t- {}", err)?;
-                }
-                Ok(())
-            }
-
-            Error::Protocol(e) => write!(f, "Electrum server error: {}", e.clone().take()),
-            Error::InvalidResponse(e) => write!(f, "Error during the deserialization of a response from the server: {}", e.clone().take()),
-
-            // TODO: Print out addresses once `ScriptHash` will implement `Display`
-            Error::AlreadySubscribed(_) => write!(f, "Already subscribed to the notifications of an address"),
-            Error::NotSubscribed(_) => write!(f, "Not subscribed to the notifications of an address"),
-
-            Error::MissingDomain => f.write_str("Missing domain while it was explicitly asked to validate it"),
-            Error::CouldntLockReader => f.write_str("Couldn't take a lock on the reader mutex. This means that there's already another reader thread is running"),
-            Error::Mpsc => f.write_str("Broken IPC communication channel: the other thread probably has exited"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-macro_rules! impl_error {
-    ( $from:ty, $to:ident ) => {
-        impl std::convert::From<$from> for Error {
-            fn from(err: $from) -> Self {
-                Error::$to(err.into())
-            }
-        }
-    };
-}
-
-impl_error!(std::io::Error, IOError);
-impl_error!(serde_json::Error, JSON);
-impl_error!(bitcoin::hashes::hex::Error, Hex);
-impl_error!(bitcoin::consensus::encode::Error, Bitcoin);
-
-impl<T> From<std::sync::PoisonError<T>> for Error {
-    fn from(_: std::sync::PoisonError<T>) -> Self {
-        Error::IOError(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
-    }
-}
-
-impl<T> From<std::sync::mpsc::SendError<T>> for Error {
-    fn from(_: std::sync::mpsc::SendError<T>) -> Self {
-        Error::Mpsc
-    }
-}
-
-impl From<std::sync::mpsc::RecvError> for Error {
-    fn from(_: std::sync::mpsc::RecvError) -> Self {
-        Error::Mpsc
-    }
 }

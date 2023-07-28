@@ -1,23 +1,22 @@
-extern crate electrum_client;
+// Copyright (c) 2023 Yuki Kishimoto
+// Distributed under the MIT software license
 
-use electrum_client::{Client, ConfigBuilder, ElectrumApi, Socks5Config};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-fn main() {
-    // NOTE: This assumes Tor is running localy, with an unauthenticated Socks5 listening at
-    // localhost:9050
-    let proxy = Socks5Config::new("127.0.0.1:9050");
-    let config = ConfigBuilder::new().socks5(Some(proxy)).build();
+use electrum_sdk::Client;
 
-    let client = Client::from_config("tcp://explorernuoc63nb.onion:110", config.clone()).unwrap();
-    let res = client.server_features();
-    println!("{:#?}", res);
+#[tokio::main]
+async fn main() {
+    env_logger::init();
 
-    // works both with onion v2/v3 (if your Tor supports them)
-    let client = Client::from_config(
+    let proxy = Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9050)));
+    let client = Client::new(
         "tcp://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion:110",
-        config,
-    )
-    .unwrap();
-    let res = client.server_features();
-    println!("{:#?}", res);
+        proxy,
+    );
+
+    client.connect(true).await;
+
+    let header = client.block_header(800_000).await.unwrap();
+    println!("{}", header.block_hash());
 }

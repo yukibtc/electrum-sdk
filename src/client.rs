@@ -1,414 +1,472 @@
+// Copyright (c) 2023 Yuki Kishimoto
+// Distributed under the MIT software license
+
 //! Electrum Client
 
-use std::sync::RwLock;
+use std::collections::HashMap;
+use std::fmt;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
-use log::{info, warn};
+use async_utility::{thread, time};
+use bitcoin::consensus::deserialize;
+use bitcoin::hashes::hex::FromHex;
+use bitcoin::BlockHeader;
+use crossbeam_channel::{bounded, Receiver as CbReceiver, RecvTimeoutError, Sender as CbSender};
+use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::oneshot;
+use tokio::sync::Mutex;
 
-use bitcoin::{Script, Txid};
+use crate::{net, types::*};
 
-use api::ElectrumApi;
-use batch::Batch;
-use config::Config;
-use raw_client::*;
-use std::convert::TryFrom;
-use types::*;
+type Message = (ClientEvent, Option<oneshot::Sender<bool>>);
 
-/// Generalized Electrum client that supports multiple backends. This wraps
-/// [`RawClient`](client/struct.RawClient.html) and provides a more user-friendly
-/// constructor that can choose the right backend based on the url prefix.
-///
-/// **This is available only with the `default` features, or if `proxy` and one ssl implementation are enabled**
-pub enum ClientType {
-    #[allow(missing_docs)]
-    TCP(RawClient<ElectrumPlaintextStream>),
-    #[allow(missing_docs)]
-    SSL(RawClient<ElectrumSslStream>),
-    #[allow(missing_docs)]
-    Socks5(RawClient<ElectrumProxyStream>),
+#[derive(Debug, Error)]
+pub enum Error {
+    /// Channel timeout
+    #[error("channel timeout")]
+    ChannelTimeout,
+    /// Message response timeout
+    #[error("recv message response timeout")]
+    RecvTimeout,
+    ///
+    #[error(transparent)]
+    CbRecvTimeout(#[from] RecvTimeoutError),
+    /// Generic timeout
+    #[error("timeout")]
+    Timeout,
+    /// Message not sent
+    #[error("message not sent")]
+    MessageNotSent,
+    /// Impossible to receive oneshot message
+    #[error("impossible to recv msg")]
+    OneShotRecvError,
 }
 
-/// Generalized Electrum client that supports multiple backends. Can re-instantiate client_type if connections
-/// drops
-pub struct Client {
-    client_type: RwLock<ClientType>,
-    config: Config,
-    url: String,
+/// Client connection status
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Status {
+    #[default]
+    Initialized,
+    Connected,
+    Connecting,
+    Disconnected,
+    Stopped,
+    Terminated,
 }
 
-macro_rules! impl_inner_call {
-    ( $self:expr, $name:ident $(, $args:expr)* ) => {
-    {
-        let mut errors = vec![];
-        loop {
-            let read_client = $self.client_type.read().unwrap();
-            let res = match &*read_client {
-                ClientType::TCP(inner) => inner.$name( $($args, )* ),
-                ClientType::SSL(inner) => inner.$name( $($args, )* ),
-                ClientType::Socks5(inner) => inner.$name( $($args, )* ),
-            };
-            drop(read_client);
-            match res {
-                Ok(val) => return Ok(val),
-                Err(Error::Protocol(_)) => {
-                    return res;
-                },
-                Err(e) => {
-                    let failed_attempts = errors.len() + 1;
-
-                    if retries_exhausted(failed_attempts, $self.config.retry()) {
-                        warn!("call '{}' failed after {} attempts", stringify!($name), failed_attempts);
-                        return Err(Error::AllAttemptsErrored(errors));
-                    }
-
-                    warn!("call '{}' failed with {}, retry: {}/{}", stringify!($name), e, failed_attempts, $self.config.retry());
-
-                    errors.push(e);
-
-                    // Only one thread will try to recreate the client getting the write lock,
-                    // other eventual threads will get Err and will block at the beginning of
-                    // previous loop when trying to read()
-                    if let Ok(mut write_client) = $self.client_type.try_write() {
-                        loop {
-                            std::thread::sleep(std::time::Duration::from_secs((1 << errors.len()).min(30) as u64));
-                            match ClientType::from_config(&$self.url, &$self.config) {
-                                Ok(new_client) => {
-                                    info!("Succesfully created new client");
-                                    *write_client = new_client;
-                                    break;
-                                },
-                                Err(e) => {
-                                    let failed_attempts = errors.len() + 1;
-
-                                    if retries_exhausted(failed_attempts, $self.config.retry()) {
-                                        warn!("re-creating client failed after {} attempts", failed_attempts);
-                                        return Err(Error::AllAttemptsErrored(errors));
-                                    }
-
-                                    warn!("re-creating client failed with {}, retry: {}/{}", e, failed_attempts, $self.config.retry());
-
-                                    errors.push(e);
-                                }
-                            }
-                        }
-                    }
-                },
-            }
-        }}
-    }
-}
-
-fn retries_exhausted(failed_attempts: usize, configured_retries: u8) -> bool {
-    match u8::try_from(failed_attempts) {
-        Ok(failed_attempts) => failed_attempts > configured_retries,
-        Err(_) => true, // if the usize doesn't fit into a u8, we definitely exhausted our retries
-    }
-}
-
-impl ClientType {
-    /// Constructor that supports multiple backends and allows configuration through
-    /// the [Config]
-    pub fn from_config(url: &str, config: &Config) -> Result<Self, Error> {
-        if url.starts_with("ssl://") {
-            let url = url.replacen("ssl://", "", 1);
-            let client = match config.socks5() {
-                Some(socks5) => RawClient::new_proxy_ssl(
-                    url.as_str(),
-                    config.validate_domain(),
-                    socks5,
-                    config.timeout(),
-                )?,
-                None => {
-                    RawClient::new_ssl(url.as_str(), config.validate_domain(), config.timeout())?
-                }
-            };
-
-            Ok(ClientType::SSL(client))
-        } else {
-            let url = url.replacen("tcp://", "", 1);
-
-            Ok(match config.socks5().as_ref() {
-                None => ClientType::TCP(RawClient::new(url.as_str(), config.timeout())?),
-                Some(socks5) => ClientType::Socks5(RawClient::new_proxy(
-                    url.as_str(),
-                    socks5,
-                    config.timeout(),
-                )?),
-            })
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Initialized => write!(f, "Initialized"),
+            Self::Connected => write!(f, "Connected"),
+            Self::Connecting => write!(f, "Connecting"),
+            Self::Disconnected => write!(f, "Disconnected"),
+            Self::Stopped => write!(f, "Stopped"),
+            Self::Terminated => write!(f, "Terminated"),
         }
     }
 }
 
+/// Client event
+#[derive(Debug)]
+pub enum ClientEvent {
+    /// Send request
+    SendRequest(Request),
+    /// Close
+    Close,
+    /// Stop
+    Stop,
+    /// Completely disconnect
+    Terminate,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientChannels {
+    header: (CbSender<BlockHeader>, CbReceiver<BlockHeader>),
+    estimate_fee: (CbSender<f64>, CbReceiver<f64>),
+}
+
+impl Default for ClientChannels {
+    fn default() -> Self {
+        Self {
+            header: bounded::<BlockHeader>(1),
+            estimate_fee: bounded::<f64>(1),
+        }
+    }
+}
+
+/// Electrum Client
+#[derive(Debug, Clone)]
+pub struct Client {
+    addr: String,
+    proxy: Option<SocketAddr>,
+    status: Arc<Mutex<Status>>,
+    last_id: Arc<AtomicUsize>,
+    channels: ClientChannels,
+    sender: Sender<Message>,
+    receiver: Arc<Mutex<Receiver<Message>>>,
+    inventory: Arc<Mutex<HashMap<usize, String>>>,
+}
+
 impl Client {
-    /// Default constructor supporting multiple backends by providing a prefix
-    ///
-    /// Supported prefixes are:
-    /// - tcp:// for a TCP plaintext client.
-    /// - ssl:// for an SSL-encrypted client. The server certificate will be verified.
-    ///
-    /// If no prefix is specified, then `tcp://` is assumed.
-    ///
-    /// See [Client::from_config] for more configuration options
-    ///
-    pub fn new(url: &str) -> Result<Self, Error> {
-        Self::from_config(url, Config::default())
-    }
-
-    /// Generic constructor that supports multiple backends and allows configuration through
-    /// the [Config]
-    pub fn from_config(url: &str, config: Config) -> Result<Self, Error> {
-        let client_type = RwLock::new(ClientType::from_config(url, &config)?);
-
-        Ok(Client {
-            client_type,
-            config,
-            url: url.to_string(),
-        })
-    }
-}
-
-impl ElectrumApi for Client {
-    #[inline]
-    fn raw_call(
-        &self,
-        method_name: &str,
-        params: impl IntoIterator<Item = Param>,
-    ) -> Result<serde_json::Value, Error> {
-        // We can't passthrough this method to the inner client because it would require the
-        // `params` argument to also be `Copy` (because it's used multiple times for multiple
-        // retries). To avoid adding this extra trait bound we instead re-direct this call to the internal
-        // `RawClient::internal_raw_call_with_vec` method.
-
-        let vec = params.into_iter().collect::<Vec<Param>>();
-        impl_inner_call!(self, internal_raw_call_with_vec, method_name, vec.clone());
-    }
-
-    #[inline]
-    fn batch_call(&self, batch: &Batch) -> Result<Vec<serde_json::Value>, Error> {
-        impl_inner_call!(self, batch_call, batch)
-    }
-
-    #[inline]
-    fn block_headers_subscribe_raw(&self) -> Result<RawHeaderNotification, Error> {
-        impl_inner_call!(self, block_headers_subscribe_raw)
-    }
-
-    #[inline]
-    fn block_headers_pop_raw(&self) -> Result<Option<RawHeaderNotification>, Error> {
-        impl_inner_call!(self, block_headers_pop_raw)
-    }
-
-    #[inline]
-    fn block_header_raw(&self, height: usize) -> Result<Vec<u8>, Error> {
-        impl_inner_call!(self, block_header_raw, height)
-    }
-
-    #[inline]
-    fn block_headers(&self, start_height: usize, count: usize) -> Result<GetHeadersRes, Error> {
-        impl_inner_call!(self, block_headers, start_height, count)
-    }
-
-    #[inline]
-    fn estimate_fee(&self, number: usize) -> Result<f64, Error> {
-        impl_inner_call!(self, estimate_fee, number)
-    }
-
-    #[inline]
-    fn relay_fee(&self) -> Result<f64, Error> {
-        impl_inner_call!(self, relay_fee)
-    }
-
-    #[inline]
-    fn script_subscribe(&self, script: &Script) -> Result<Option<ScriptStatus>, Error> {
-        impl_inner_call!(self, script_subscribe, script)
-    }
-
-    #[inline]
-    fn script_unsubscribe(&self, script: &Script) -> Result<bool, Error> {
-        impl_inner_call!(self, script_unsubscribe, script)
-    }
-
-    #[inline]
-    fn script_pop(&self, script: &Script) -> Result<Option<ScriptStatus>, Error> {
-        impl_inner_call!(self, script_pop, script)
-    }
-
-    #[inline]
-    fn script_get_balance(&self, script: &Script) -> Result<GetBalanceRes, Error> {
-        impl_inner_call!(self, script_get_balance, script)
-    }
-
-    #[inline]
-    fn batch_script_get_balance<'s, I>(&self, scripts: I) -> Result<Vec<GetBalanceRes>, Error>
+    /// New Client
+    pub fn new<S>(addr: S, proxy: Option<SocketAddr>) -> Self
     where
-        I: IntoIterator<Item = &'s Script> + Clone,
+        S: Into<String>,
     {
-        impl_inner_call!(self, batch_script_get_balance, scripts.clone())
+        let (sender, receiver) = mpsc::channel::<Message>(1024);
+
+        Self {
+            addr: addr.into(),
+            proxy,
+            status: Arc::new(Mutex::new(Status::default())),
+            last_id: Arc::new(AtomicUsize::new(0)),
+            channels: ClientChannels::default(),
+            sender,
+            receiver: Arc::new(Mutex::new(receiver)),
+            inventory: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+    pub fn addr(&self) -> String {
+        self.addr.clone()
     }
 
-    #[inline]
-    fn script_get_history(&self, script: &Script) -> Result<Vec<GetHistoryRes>, Error> {
-        impl_inner_call!(self, script_get_history, script)
+    pub fn proxy(&self) -> Option<SocketAddr> {
+        self.proxy
     }
 
-    #[inline]
-    fn batch_script_get_history<'s, I>(&self, scripts: I) -> Result<Vec<Vec<GetHistoryRes>>, Error>
-    where
-        I: IntoIterator<Item = &'s Script> + Clone,
-    {
-        impl_inner_call!(self, batch_script_get_history, scripts.clone())
+    pub async fn status(&self) -> Status {
+        let status = self.status.lock().await;
+        status.clone()
     }
 
-    #[inline]
-    fn script_list_unspent(&self, script: &Script) -> Result<Vec<ListUnspentRes>, Error> {
-        impl_inner_call!(self, script_list_unspent, script)
+    async fn set_status(&self, status: Status) {
+        let mut s = self.status.lock().await;
+        *s = status;
     }
 
-    #[inline]
-    fn batch_script_list_unspent<'s, I>(
-        &self,
-        scripts: I,
-    ) -> Result<Vec<Vec<ListUnspentRes>>, Error>
-    where
-        I: IntoIterator<Item = &'s Script> + Clone,
-    {
-        impl_inner_call!(self, batch_script_list_unspent, scripts.clone())
+    pub async fn is_connected(&self) -> bool {
+        self.status().await == Status::Connected
     }
 
-    #[inline]
-    fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>, Error> {
-        impl_inner_call!(self, transaction_get_raw, txid)
-    }
-
-    #[inline]
-    fn batch_transaction_get_raw<'t, I>(&self, txids: I) -> Result<Vec<Vec<u8>>, Error>
-    where
-        I: IntoIterator<Item = &'t Txid> + Clone,
-    {
-        impl_inner_call!(self, batch_transaction_get_raw, txids.clone())
-    }
-
-    #[inline]
-    fn batch_block_header_raw<'s, I>(&self, heights: I) -> Result<Vec<Vec<u8>>, Error>
-    where
-        I: IntoIterator<Item = u32> + Clone,
-    {
-        impl_inner_call!(self, batch_block_header_raw, heights.clone())
-    }
-
-    #[inline]
-    fn batch_estimate_fee<'s, I>(&self, numbers: I) -> Result<Vec<f64>, Error>
-    where
-        I: IntoIterator<Item = usize> + Clone,
-    {
-        impl_inner_call!(self, batch_estimate_fee, numbers.clone())
-    }
-
-    #[inline]
-    fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid, Error> {
-        impl_inner_call!(self, transaction_broadcast_raw, raw_tx)
-    }
-
-    #[inline]
-    fn transaction_get_merkle(&self, txid: &Txid, height: usize) -> Result<GetMerkleRes, Error> {
-        impl_inner_call!(self, transaction_get_merkle, txid, height)
-    }
-
-    #[inline]
-    fn server_features(&self) -> Result<ServerFeaturesRes, Error> {
-        impl_inner_call!(self, server_features)
-    }
-
-    #[inline]
-    fn ping(&self) -> Result<(), Error> {
-        impl_inner_call!(self, ping)
-    }
-
-    #[inline]
-    #[cfg(feature = "debug-calls")]
-    fn calls_made(&self) -> Result<usize, Error> {
-        impl_inner_call!(self, calls_made)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn more_failed_attempts_than_retries_means_exhausted() {
-        let exhausted = retries_exhausted(10, 5);
-
-        assert_eq!(exhausted, true)
-    }
-
-    #[test]
-    fn failed_attempts_bigger_than_u8_means_exhausted() {
-        let failed_attempts = u8::MAX as usize + 1;
-
-        let exhausted = retries_exhausted(failed_attempts, u8::MAX);
-
-        assert_eq!(exhausted, true)
-    }
-
-    #[test]
-    fn less_failed_attempts_means_not_exhausted() {
-        let exhausted = retries_exhausted(2, 5);
-
-        assert_eq!(exhausted, false)
-    }
-
-    #[test]
-    fn attempts_equals_retries_means_not_exhausted_yet() {
-        let exhausted = retries_exhausted(2, 2);
-
-        assert_eq!(exhausted, false)
-    }
-
-    #[test]
-    #[ignore]
-    fn test_local_timeout() {
-        // This test assumes a couple things:
-        // - that `localhost` is resolved to two IP addresses, `127.0.0.1` and `::1` (with the v6
-        //   one having higher priority)
-        // - that the system silently drops packets to `[::1]:60000` or a different port if
-        //   specified through `TEST_ELECTRUM_TIMEOUT_PORT`
-        //
-        //   this can be setup with: ip6tables -I INPUT 1 -p tcp -d ::1 --dport 60000 -j DROP
-        //   and removed with:       ip6tables -D INPUT -p tcp -d ::1 --dport 60000 -j DROP
-        //
-        // The test tries to create a client to `localhost` and expects it to succeed, but only
-        // after at least 2 seconds have passed which is roughly the timeout time for the first
-        // try.
-
-        use std::net::TcpListener;
-        use std::sync::mpsc::channel;
-        use std::time::{Duration, Instant};
-
-        let endpoint =
-            std::env::var("TEST_ELECTRUM_TIMEOUT_PORT").unwrap_or("localhost:60000".into());
-        let (sender, receiver) = channel();
-
-        std::thread::spawn(move || {
-            let listener = TcpListener::bind("127.0.0.1:60000").unwrap();
-            sender.send(()).unwrap();
-
-            for _stream in listener.incoming() {
-                loop {}
+    /// Connect to electrum server and keep alive connection
+    pub async fn connect(&self, wait_for_connection: bool) {
+        if let Status::Initialized | Status::Stopped | Status::Terminated = self.status().await {
+            if wait_for_connection {
+                self.try_connect().await
+            } else {
+                // Update status
+                self.set_status(Status::Disconnected).await;
             }
-        });
 
-        receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("Can't start local listener");
+            let client = self.clone();
+            thread::spawn(async move {
+                loop {
+                    log::debug!(
+                        "{} channel capacity: {}",
+                        client.addr(),
+                        client.sender.capacity()
+                    );
 
-        let now = Instant::now();
-        let client = Client::from_config(
-            &endpoint,
-            crate::config::ConfigBuilder::new().timeout(Some(5)).build(),
+                    // Schedule relay for termination
+                    // Needed to terminate the auto reconnect loop, also if the relay is not connected yet.
+                    /* if client.is_scheduled_for_termination() {
+                        client.set_status(Status::Terminated).await;
+                        client.schedule_for_termination(false);
+                        log::debug!("Auto connect loop terminated for {} [schedule]", client.url);
+                        break;
+                    } */
+
+                    // Check status
+                    match client.status().await {
+                        Status::Disconnected => client.try_connect().await,
+                        Status::Terminated => {
+                            log::debug!("Auto connect loop terminated for {}", client.addr);
+                            break;
+                        }
+                        _ => (),
+                    };
+
+                    thread::sleep(Duration::from_secs(20)).await;
+                }
+            });
+        }
+    }
+
+    async fn try_connect(&self) {
+        let addr: String = self.addr();
+
+        // Set Status to `Connecting`
+        self.set_status(Status::Connecting).await;
+        log::debug!("Connecting to {}", addr);
+
+        // Connect
+        match net::connect(self.addr(), self.proxy, None).await {
+            Ok(stream) => {
+                let (read, mut write) = tokio::io::split(stream);
+
+                self.set_status(Status::Connected).await;
+                log::info!("Connected to {}", addr);
+
+                let client = self.clone();
+                thread::spawn(async move {
+                    log::debug!("Relay Event Thread Started");
+                    let mut rx = client.receiver.lock().await;
+                    while let Some((event, oneshot_sender)) = rx.recv().await {
+                        match event {
+                            ClientEvent::SendRequest(req) => {
+                                let json = req.as_json();
+                                log::debug!("Sending message {json}");
+                                match write.write_all(&req.as_bytes().unwrap()).await {
+                                    Ok(_) => {
+                                        if let Some(sender) = oneshot_sender {
+                                            if let Err(e) = sender.send(true) {
+                                                log::error!(
+                                                    "Impossible to send oneshot msg: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "Impossible to send msg to {}: {}",
+                                            client.addr(),
+                                            e.to_string()
+                                        );
+                                        if let Some(sender) = oneshot_sender {
+                                            if let Err(e) = sender.send(false) {
+                                                log::error!(
+                                                    "Impossible to send oneshot msg: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            ClientEvent::Close => {
+                                let _ = write.shutdown().await;
+                                client.set_status(Status::Disconnected).await;
+                                log::info!("Disconnected from {}", addr);
+                                break;
+                            }
+                            ClientEvent::Stop => {
+                                /* if client.is_scheduled_for_stop() {
+                                    let _ = ws_tx.close().await;
+                                    client.set_status(Status::Stopped).await;
+                                    client.schedule_for_stop(false);
+                                    log::info!("Stopped {}", addr);
+                                    break;
+                                } */
+                            }
+                            ClientEvent::Terminate => {
+                                /* if client.is_scheduled_for_termination() {
+                                    // Unsubscribe from client
+                                    if let Err(e) = client.unsubscribe(None).await {
+                                        log::error!(
+                                            "Impossible to unsubscribe from {}: {}",
+                                            client.addr(),
+                                            e.to_string()
+                                        )
+                                    }
+                                    // Close stream
+                                    let _ = ws_tx.close().await;
+                                    client.set_status(Status::Terminated).await;
+                                    client.schedule_for_termination(false);
+                                    log::info!("Completely disconnected from {}", addr);
+                                    break;
+                                } */
+                            }
+                        }
+                    }
+                    log::debug!("Exited from Client Event Thread");
+                });
+
+                let client = self.clone();
+                thread::spawn(async move {
+                    log::debug!("Relay Message Thread Started");
+
+                    let mut reader = BufReader::new(read);
+                    let mut data = String::new();
+                    loop {
+                        data.clear();
+
+                        reader.read_line(&mut data).await.unwrap();
+
+                        match Response::from_json(&data) {
+                            Ok(res) => {
+                                log::trace!("Received response: {data}");
+
+                                // Get method from inventory by ID and deserialize
+                                let mut inventory = client.inventory.lock().await;
+
+                                if let Some(e) = res.error {
+                                    log::error!("Received error: {e}");
+                                    inventory.remove(&res.id);
+                                } else if let Some(result) = res.result {
+                                    match inventory.get(&res.id) {
+                                        Some(method) => match method.as_str() {
+                                            "blockchain.block.header" => {
+                                                let data =
+                                                    Vec::<u8>::from_hex(result.as_str().unwrap())
+                                                        .unwrap();
+                                                let header: BlockHeader =
+                                                    deserialize(&data).unwrap();
+                                                client.channels.header.0.send(header).unwrap();
+                                            }
+                                            "blockchain.estimatefee" => {
+                                                let fee: f64 =
+                                                    serde_json::from_value(result).unwrap();
+                                                client.channels.estimate_fee.0.send(fee).unwrap();
+                                            }
+                                            _ => log::warn!("NOT IMPLEMENTED"),
+                                        },
+                                        None => log::error!("ID not found in inventory"),
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                log::error!("{err}");
+                                break;
+                            }
+                        };
+                    }
+
+                    log::debug!("Exited from Message Thread of {}", client.addr);
+
+                    if let Err(err) = client.disconnect().await {
+                        log::error!("Impossible to disconnect {}: {}", client.addr, err);
+                    }
+                });
+            }
+            Err(err) => {
+                self.set_status(Status::Disconnected).await;
+                log::error!("Impossible to connect to {}: {}", addr, err);
+            }
+        };
+    }
+
+    fn send_client_event(
+        &self,
+        relay_msg: ClientEvent,
+        sender: Option<oneshot::Sender<bool>>,
+    ) -> Result<(), Error> {
+        self.sender
+            .try_send((relay_msg, sender))
+            .map_err(|_| Error::MessageNotSent)
+    }
+
+    /// Disconnect from relay and set status to 'Disconnected'
+    async fn disconnect(&self) -> Result<(), Error> {
+        let status = self.status().await;
+        if status.ne(&Status::Disconnected)
+            && status.ne(&Status::Stopped)
+            && status.ne(&Status::Terminated)
+        {
+            self.send_client_event(ClientEvent::Close, None)?;
+        }
+        Ok(())
+    }
+
+    /* /// Disconnect from relay and set status to 'Stopped'
+    pub async fn stop(&self) -> Result<(), Error> {
+        self.schedule_for_stop(true);
+        let status = self.status().await;
+        if status.ne(&Status::Disconnected)
+            && status.ne(&Status::Stopped)
+            && status.ne(&Status::Terminated)
+        {
+            self.send_client_event(ClientEvent::Stop, None)?;
+        }
+        Ok(())
+    }
+
+    /// Disconnect from relay and set status to 'Terminated'
+    pub async fn terminate(&self) -> Result<(), Error> {
+        self.schedule_for_termination(true);
+        let status = self.status().await;
+        if status.ne(&Status::Disconnected)
+            && status.ne(&Status::Stopped)
+            && status.ne(&Status::Terminated)
+        {
+            self.send_client_event(ClientEvent::Terminate, None)?;
+        }
+        Ok(())
+    } */
+
+    pub async fn send_msg(&self, msg: Request, wait: Option<Duration>) -> Result<(), Error> {
+        match wait {
+            Some(timeout) => {
+                let (tx, rx) = oneshot::channel::<bool>();
+                self.send_client_event(ClientEvent::SendRequest(msg), Some(tx))?;
+                match time::timeout(Some(timeout), rx).await {
+                    Some(result) => match result {
+                        Ok(val) => {
+                            if val {
+                                Ok(())
+                            } else {
+                                Err(Error::MessageNotSent)
+                            }
+                        }
+                        Err(_) => Err(Error::OneShotRecvError),
+                    },
+                    _ => Err(Error::RecvTimeout),
+                }
+            }
+            None => self.send_client_event(ClientEvent::SendRequest(msg), None),
+        }
+    }
+
+    /// Get block header
+    pub async fn block_header(&self, height: usize) -> Result<BlockHeader, Error> {
+        let next_id = self.last_id.fetch_add(1, Ordering::SeqCst);
+        let req = Request::new(
+            next_id,
+            "blockchain.block.header",
+            vec![Param::Usize(height)],
         );
-        let elapsed = now.elapsed();
 
-        assert!(client.is_ok());
-        assert!(elapsed > Duration::from_secs(2));
+        {
+            let mut inventory = self.inventory.lock().await;
+            inventory.insert(req.id, req.method.clone());
+        }
+
+        self.send_msg(req, Some(Duration::from_secs(30))).await?;
+
+        Ok(self
+            .channels
+            .header
+            .1
+            .recv_timeout(Duration::from_secs(30))?)
+    }
+
+    /// Estimate fee
+    pub async fn estimate_fee(&self, number: usize) -> Result<f64, Error> {
+        let next_id = self.last_id.fetch_add(1, Ordering::SeqCst);
+        let req = Request::new(
+            next_id,
+            "blockchain.estimatefee",
+            vec![Param::Usize(number)],
+        );
+
+        {
+            let mut inventory = self.inventory.lock().await;
+            inventory.insert(req.id, req.method.clone());
+        }
+
+        self.send_msg(req, Some(Duration::from_secs(30))).await?;
+
+        Ok(self
+            .channels
+            .estimate_fee
+            .1
+            .recv_timeout(Duration::from_secs(30))?)
     }
 }
