@@ -9,7 +9,7 @@ use bitcoin::blockdata::block;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::{sha256, Hash};
-use bitcoin::{Script, Txid};
+use bitcoin::{BlockHeader, Script, Txid};
 use serde::{de, Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -69,6 +69,7 @@ pub enum Param {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Request {
     GetBlockHeader { height: usize },
+    BlockHeaderSubscribe,
     EstimateFee { blocks: u8 },
 }
 
@@ -77,6 +78,7 @@ impl Request {
     pub fn method(&self) -> String {
         match self {
             Self::GetBlockHeader { .. } => "blockchain.block.header".to_string(),
+            Self::BlockHeaderSubscribe => "blockchain.headers.subscribe".to_string(),
             Self::EstimateFee { .. } => "blockchain.estimatefee".to_string(),
         }
     }
@@ -85,9 +87,17 @@ impl Request {
     pub fn params(&self) -> Vec<Param> {
         match self {
             Self::GetBlockHeader { height } => vec![Param::Usize(*height)],
+            Self::BlockHeaderSubscribe => Vec::new(),
             Self::EstimateFee { blocks } => vec![Param::U8(*blocks)],
         }
     }
+}
+
+/// Response
+#[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum Response {
+    BlockHeader(BlockHeader),
+    EstimateFee(f64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
