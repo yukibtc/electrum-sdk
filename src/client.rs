@@ -20,8 +20,8 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::net;
 use crate::types::{
-    GetBalanceRes, GetHeadersRes, GetHistoryRes, GetMerkleRes, JsonRpcMsg, ListUnspentRes,
-    Notification, Request, Response, ScriptStatus, ServerFeaturesRes,
+    GetBalanceRes, GetHeadersRes, GetHistoryRes, JsonRpcMsg, Notification, Request, Response,
+    ScriptStatus, ServerFeaturesRes,
 };
 
 type Message = (ClientEvent, Option<oneshot::Sender<bool>>);
@@ -860,6 +860,17 @@ impl Client {
         let req = Request::GetHistory(script);
         match self.call(req, timeout).await? {
             Some(Response::History(history)) => Ok(history),
+            _ => Err(Error::InvalidResponse),
+        }
+    }
+
+    pub async fn server_features(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<ServerFeaturesRes, Error> {
+        let req = Request::Features;
+        match self.call(req, timeout).await? {
+            Some(Response::Features(features)) => Ok(features),
             _ => Err(Error::InvalidResponse),
         }
     }

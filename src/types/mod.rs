@@ -88,6 +88,7 @@ pub enum Request {
     GetTransaction(Txid),
     GetBalance(Script),
     GetHistory(Script),
+    Features,
     Version { name: String, version: f32 },
     Ping,
 }
@@ -106,6 +107,7 @@ impl Request {
             Self::GetTransaction(..) => Method::GetTransaction,
             Self::GetBalance(..) => Method::GetBalance,
             Self::GetHistory(..) => Method::GetHistory,
+            Self::Features => Method::Features,
             Self::Version { .. } => Method::Version,
             Self::Ping => Method::Ping,
         }
@@ -137,7 +139,7 @@ impl Request {
                 Param::String(name.clone()),
                 Param::String(version.to_string()),
             ],
-            Self::Ping => Vec::new(),
+            Self::Features | Self::Ping => Vec::new(),
         }
     }
 }
@@ -155,6 +157,7 @@ pub enum Response {
     Transaction(Transaction),
     Balance(GetBalanceRes),
     History(GetHistoryRes),
+    Features(ServerFeaturesRes),
     Pong,
     Null,
 }
@@ -309,6 +312,10 @@ impl JsonRpcMsg {
                     Request::GetHistory(..) => {
                         let history: GetHistoryRes = serde_json::from_value(result)?;
                         Ok(Response::History(history))
+                    }
+                    Request::Features => {
+                        let features: ServerFeaturesRes = serde_json::from_value(result)?;
+                        Ok(Response::Features(features))
                     }
                     Request::Ping => Ok(Response::Pong),
                     Request::Version { .. } => Ok(Response::Null),
