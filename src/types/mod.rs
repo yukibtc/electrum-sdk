@@ -8,7 +8,7 @@ use bitcoin::blockdata::block;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::{sha256, Hash};
-use bitcoin::{BlockHeader, Script, Txid};
+use bitcoin::{BlockHeader, Script, Transaction, Txid};
 use serde::{de, Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -57,6 +57,9 @@ pub enum Error {
     /// Unexpected msg
     #[error("unexpected msg")]
     UnexpectedMsg,
+    /// Unexpected request
+    #[error("unexpected request")]
+    UnexpectedRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +86,7 @@ pub enum Request {
     GetBlockHeader { height: usize },
     BlockHeaderSubscribe,
     EstimateFee { blocks: u8 },
+    GetTransaction(Txid),
     Version { name: String, version: f32 },
     Ping,
 }
@@ -94,6 +98,7 @@ impl Request {
             Self::GetBlockHeader { .. } => Method::GetBlockHeader,
             Self::BlockHeaderSubscribe => Method::BlockHeaderSubscribe,
             Self::EstimateFee { .. } => Method::EstimateFee,
+            Self::GetTransaction(..) => Method::GetTransaction,
             Self::Version { .. } => Method::Version,
             Self::Ping => Method::Ping,
         }
@@ -105,6 +110,7 @@ impl Request {
             Self::GetBlockHeader { height } => vec![Param::Usize(*height)],
             Self::BlockHeaderSubscribe => Vec::new(),
             Self::EstimateFee { blocks } => vec![Param::U8(*blocks)],
+            Self::GetTransaction(txid) => vec![Param::String(txid.to_string())],
             Self::Version { name, version } => vec![
                 Param::String(name.clone()),
                 Param::String(version.to_string()),
@@ -120,6 +126,7 @@ pub enum Response {
     BlockHeader(BlockHeader),
     HeaderNotification(HeaderNotification),
     EstimateFee(f64),
+    Transaction(Transaction),
     Pong,
 }
 
@@ -222,7 +229,8 @@ impl JsonRpcMsg {
             if let Some(result) = result {
                 match req {
                     Request::GetBlockHeader { .. } => {
-                        let data = Vec::<u8>::from_hex(result.as_str().unwrap())?;
+                        let data: String = serde_json::from_value(result.clone())?;
+                        let data: Vec<u8> = Vec::<u8>::from_hex(&data)?;
                         let header: BlockHeader = deserialize(&data)?;
                         Ok(Response::BlockHeader(header))
                     }
@@ -236,7 +244,13 @@ impl JsonRpcMsg {
                         let fee: f64 = serde_json::from_value(result.clone())?;
                         Ok(Response::EstimateFee(fee))
                     }
-                    _ => todo!(),
+                    Request::GetTransaction(..) => {
+                        let data: String = serde_json::from_value(result.clone())?;
+                        let data: Vec<u8> = Vec::<u8>::from_hex(&data)?;
+                        let tx: Transaction = deserialize(&data)?;
+                        Ok(Response::Transaction(tx))
+                    }
+                    _ => Err(Error::UnexpectedRequest),
                 }
             } else if let Some(e) = error {
                 Err(Error::Protocol(e.clone()))

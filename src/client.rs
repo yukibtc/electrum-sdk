@@ -235,7 +235,7 @@ impl Client {
                     loop {
                         thread::sleep(Duration::from_secs(45)).await;
 
-                        if let Err(e) = client.ping().await {
+                        if let Err(e) = client.ping(Some(Duration::from_secs(10))).await {
                             log::error!("Impossible to ping: {e}");
                         }
                     }
@@ -521,43 +521,52 @@ impl Client {
 }
 
 impl Client {
-    /* async fn version(&self) -> Result<(), Error> {
-        let req = Request::Version {
-            name: String::from("Electrum SDK"),
-            version: 1.4,
-        };
-        self.send_msg(req, Some(Duration::from_secs(30))).await?;
-        Ok(())
-    } */
-
-    pub async fn ping(&self) -> Result<(), Error> {
+    pub async fn ping(&self, timeout: Option<Duration>) -> Result<(), Error> {
         let req = Request::Ping;
-        self.send_msg(req, Some(Duration::from_secs(30))).await?;
+        self.send_msg(req, timeout).await?;
         Ok(())
     }
 
-    pub async fn block_header(&self, height: usize) -> Result<BlockHeader, Error> {
+    pub async fn block_header(
+        &self,
+        height: usize,
+        timeout: Option<Duration>,
+    ) -> Result<BlockHeader, Error> {
         let req = Request::GetBlockHeader { height };
-        let id = self.send_msg(req, Some(Duration::from_secs(30))).await?;
-        let res = self.get_response(id, Some(Duration::from_secs(30))).await?;
+        let id = self.send_msg(req, timeout).await?;
+        let res = self.get_response(id, timeout).await?;
         match res {
             Some(Response::BlockHeader(header)) => Ok(header),
             _ => Err(Error::InvalidResponse),
         }
     }
 
-    pub async fn block_headers_subscribe(&self) -> Result<(), Error> {
+    pub async fn block_headers_subscribe(&self, timeout: Option<Duration>) -> Result<(), Error> {
         let req = Request::BlockHeaderSubscribe;
-        self.send_msg(req, Some(Duration::from_secs(30))).await?;
+        self.send_msg(req, timeout).await?;
         Ok(())
     }
 
-    pub async fn estimate_fee(&self, blocks: u8) -> Result<f64, Error> {
+    pub async fn estimate_fee(&self, blocks: u8, timeout: Option<Duration>) -> Result<f64, Error> {
         let req = Request::EstimateFee { blocks };
-        let id = self.send_msg(req, Some(Duration::from_secs(30))).await?;
-        let res = self.get_response(id, Some(Duration::from_secs(30))).await?;
+        let id = self.send_msg(req, timeout).await?;
+        let res = self.get_response(id, timeout).await?;
         match res {
             Some(Response::EstimateFee(fee)) => Ok(fee),
+            _ => Err(Error::InvalidResponse),
+        }
+    }
+
+    pub async fn get_transaction(
+        &self,
+        txid: Txid,
+        timeout: Option<Duration>,
+    ) -> Result<Transaction, Error> {
+        let req = Request::GetTransaction(txid);
+        let id = self.send_msg(req, timeout).await?;
+        let res = self.get_response(id, timeout).await?;
+        match res {
+            Some(Response::Transaction(tx)) => Ok(tx),
             _ => Err(Error::InvalidResponse),
         }
     }

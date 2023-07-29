@@ -22,6 +22,7 @@ pub enum Method {
     GetBlockHeader,
     BlockHeaderSubscribe,
     EstimateFee,
+    GetTransaction,
     Version,
     Ping,
 }
@@ -32,6 +33,7 @@ impl fmt::Display for Method {
             Self::GetBlockHeader => write!(f, "blockchain.block.header"),
             Self::BlockHeaderSubscribe => write!(f, "blockchain.headers.subscribe"),
             Self::EstimateFee => write!(f, "blockchain.estimatefee"),
+            Self::GetTransaction => write!(f, "blockchain.transaction.get"),
             Self::Version => write!(f, "server.version"),
             Self::Ping => write!(f, "server.ping"),
         }
@@ -45,6 +47,7 @@ impl FromStr for Method {
             "blockchain.block.header" => Ok(Self::GetBlockHeader),
             "blockchain.headers.subscribe" => Ok(Self::BlockHeaderSubscribe),
             "blockchain.estimatefee" => Ok(Self::EstimateFee),
+            "blockchain.transaction.get" => Ok(Self::GetTransaction),
             "server.version" => Ok(Self::Version),
             "server.ping" => Ok(Self::Ping),
             m => Err(Error::UnknownMethod(m.to_string())),

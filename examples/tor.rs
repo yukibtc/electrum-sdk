@@ -2,8 +2,11 @@
 // Distributed under the MIT software license
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::time::Duration;
 
 use electrum_sdk::Client;
+
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() {
@@ -17,6 +20,6 @@ async fn main() {
 
     client.connect(true).await;
 
-    let header = client.block_header(800_000).await.unwrap();
+    let header = client.block_header(800_000, Some(TIMEOUT)).await.unwrap();
     println!("{}", header.block_hash());
 }
