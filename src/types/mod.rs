@@ -6,7 +6,7 @@ use std::ops::Deref;
 
 use bitcoin::blockdata::block;
 use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::hashes::hex::FromHex;
+use bitcoin::hashes::hex::{FromHex, ToHex};
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::{BlockHeader, Script, Transaction, Txid};
 use serde::{de, Deserialize, Serialize};
@@ -83,6 +83,7 @@ pub enum Request {
     GetBlockHeader { height: usize },
     GetBlockHeaders { start_height: usize, count: usize },
     BlockHeaderSubscribe,
+    ScriptSubscribe(Script),
     EstimateFee { blocks: u8 },
     BroadcastTx(Transaction),
     GetTransaction(Txid),
@@ -97,6 +98,7 @@ impl Request {
             Self::GetBlockHeader { .. } => Method::GetBlockHeader,
             Self::GetBlockHeaders { .. } => Method::GetBlockHeaders,
             Self::BlockHeaderSubscribe => Method::BlockHeaderSubscribe,
+            Self::ScriptSubscribe(..) => Method::ScriptSubscribe,
             Self::EstimateFee { .. } => Method::EstimateFee,
             Self::BroadcastTx(..) => Method::BroadcastTx,
             Self::GetTransaction(..) => Method::GetTransaction,
@@ -114,6 +116,10 @@ impl Request {
                 count,
             } => vec![Param::Usize(*start_height), Param::Usize(*count)],
             Self::BlockHeaderSubscribe => Vec::new(),
+            Self::ScriptSubscribe(script) => {
+                let script_hash = script.to_electrum_scripthash();
+                vec![Param::String(script_hash.to_hex())]
+            }
             Self::EstimateFee { blocks } => vec![Param::U8(*blocks)],
             Self::BroadcastTx(tx) => {
                 let buffer: Vec<u8> = serialize(tx);
@@ -135,6 +141,7 @@ pub enum Response {
     BlockHeader(BlockHeader),
     BlockHeaders(GetHeadersRes),
     HeaderNotification(HeaderNotification),
+    ScriptStatus(Option<ScriptStatus>),
     EstimateFee(f64),
     BroadcastTx(Txid),
     Transaction(Transaction),
@@ -146,7 +153,7 @@ pub enum Response {
 #[derive(Debug, Clone)]
 pub enum Notification {
     Headers(Vec<HeaderNotification>),
-    ScriptHash(ScriptNotification),
+    Script(ScriptNotification),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +270,10 @@ impl JsonRpcMsg {
                         let notification = HeaderNotification::try_from(notification)?;
                         Ok(Response::HeaderNotification(notification))
                     }
+                    Request::ScriptSubscribe(..) => {
+                        let status: Option<ScriptStatus> = serde_json::from_value(result)?;
+                        Ok(Response::ScriptStatus(status))
+                    }
                     Request::EstimateFee { .. } => {
                         let fee: f64 = serde_json::from_value(result)?;
                         Ok(Response::EstimateFee(fee))
@@ -283,7 +294,7 @@ impl JsonRpcMsg {
             } else if let Some(e) = error {
                 Err(Error::Protocol(e.clone()))
             } else {
-                Ok(Response::Pong)
+                Ok(Response::Null)
             }
         } else {
             Err(Error::UnexpectedMsg)
@@ -300,6 +311,10 @@ impl JsonRpcMsg {
                         notifications.push(HeaderNotification::try_from(n)?);
                     }
                     Ok(Notification::Headers(notifications))
+                }
+                Method::ScriptSubscribe => {
+                    let notification: ScriptNotification = serde_json::from_value(params.clone())?;
+                    Ok(Notification::Script(notification))
                 }
                 m => Err(Error::UnexpectedMethod(*m)),
             }
@@ -345,7 +360,6 @@ impl ToElectrumScriptHash for Script {
     fn to_electrum_scripthash(&self) -> ScriptHash {
         let mut result = sha256::Hash::hash(self.as_bytes()).into_inner();
         result.reverse();
-
         result.into()
     }
 }

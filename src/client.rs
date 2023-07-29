@@ -3,7 +3,7 @@
 
 //! Electrum Client
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -47,6 +47,9 @@ pub enum Error {
     /// Invalid response
     #[error("invalid response")]
     InvalidResponse,
+    /// Already subscribed to script
+    #[error("Already subscribed to the notifications of script {0}")]
+    AlreadySubscribed(Script),
 }
 
 /// Client connection status
@@ -104,6 +107,7 @@ pub enum ClientNotification {
 #[derive(Debug, Clone, Default)]
 struct ActiveSubscriptions {
     headers: Arc<AtomicBool>,
+    scripts: Arc<Mutex<HashSet<Script>>>,
 }
 
 impl ActiveSubscriptions {
@@ -115,6 +119,11 @@ impl ActiveSubscriptions {
         let _ = self
             .headers
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |_| Some(enabled));
+    }
+
+    async fn scripts(&self) -> Vec<Script> {
+        let scripts = self.scripts.lock().await;
+        scripts.iter().cloned().collect()
     }
 }
 
@@ -456,8 +465,15 @@ impl Client {
                 });
 
                 if self.subscriptions.headers() {
-                    if let Err(e) = self.block_headers_subscribe(None).await {
+                    if let Err(e) = self._block_headers_subscribe(None).await {
                         log::error!("Impossible to subscribe to headers: {e}");
+                    }
+                }
+
+                let scripts = self.subscriptions.scripts().await;
+                for script in scripts.into_iter() {
+                    if let Err(e) = self._script_subscribe(script, None).await {
+                        log::error!("Impossible to subscribe to script: {e}");
                     }
                 }
             }
@@ -611,13 +627,47 @@ impl Client {
         }
     }
 
-    pub async fn block_headers_subscribe(&self, timeout: Option<Duration>) -> Result<(), Error> {
-        self.subscriptions.set_headers(true);
+    async fn _block_headers_subscribe(&self, timeout: Option<Duration>) -> Result<(), Error> {
         let req = Request::BlockHeaderSubscribe;
         self.send_msg(req, timeout).await?;
         Ok(())
     }
 
+    pub async fn block_headers_subscribe(&self, timeout: Option<Duration>) -> Result<(), Error> {
+        self.subscriptions.set_headers(true);
+        self._block_headers_subscribe(timeout).await
+    }
+
+    async fn _script_subscribe(
+        &self,
+        script: Script,
+        timeout: Option<Duration>,
+    ) -> Result<Option<ScriptStatus>, Error> {
+        let req = Request::ScriptSubscribe(script);
+        let id = self.send_msg(req, timeout).await?;
+        let res = self.get_response(id, timeout).await?;
+        match res {
+            Some(Response::ScriptStatus(status)) => Ok(status),
+            Some(Response::Null) => Ok(None),
+            _ => Err(Error::InvalidResponse),
+        }
+    }
+
+    pub async fn script_subscribe(
+        &self,
+        script: Script,
+        timeout: Option<Duration>,
+    ) -> Result<Option<ScriptStatus>, Error> {
+        let mut scripts = self.subscriptions.scripts.lock().await;
+        if scripts.contains(&script) {
+            return Err(Error::AlreadySubscribed(script));
+        }
+        scripts.insert(script.clone());
+        drop(scripts);
+        self._script_subscribe(script, timeout).await
+    }
+
+    /// Estimates the fee required in Bitcoin per kilobyte to confirm a transaction in number blocks.
     pub async fn estimate_fee(&self, blocks: u8, timeout: Option<Duration>) -> Result<f64, Error> {
         let req = Request::EstimateFee { blocks };
         let id = self.send_msg(req, timeout).await?;
