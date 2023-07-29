@@ -262,6 +262,11 @@ impl Client {
             let client = self.clone();
             thread::spawn(async move {
                 loop {
+                    log::debug!(
+                        "Electrum client channel capacicy: {}",
+                        client.sender.capacity()
+                    );
+
                     // Schedule client for termination
                     // Needed to terminate the auto reconnect loop, also if the client is not connected yet.
                     if client.schedule.is_scheduled_for_stop() {
