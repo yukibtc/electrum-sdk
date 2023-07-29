@@ -19,8 +19,6 @@ pub use self::method::Method;
 
 static JSONRPC_2_0: &str = "2.0";
 
-//pub type Call = (String, Vec<Param>);
-
 /// Errors
 #[derive(Debug, Error)]
 pub enum Error {

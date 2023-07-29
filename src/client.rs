@@ -82,6 +82,8 @@ impl fmt::Display for Status {
 pub enum ClientEvent {
     /// Send request
     SendMsg(JsonRpcMsg),
+    /// Send batch request
+    SendBatch(Vec<JsonRpcMsg>),
     /// Close
     Close,
     /// Stop
@@ -319,33 +321,82 @@ impl Client {
                                 if msg.is_request() {
                                     let json = msg.as_json();
                                     log::debug!("Sending message {json}");
-                                    match write.write_all(&msg.as_bytes().unwrap()).await {
-                                        Ok(_) => {
-                                            if let Some(sender) = oneshot_sender {
-                                                if let Err(e) = sender.send(true) {
-                                                    log::error!(
-                                                        "Impossible to send oneshot msg: {}",
-                                                        e
-                                                    );
+                                    match msg.as_bytes() {
+                                        Ok(bytes) => match write.write_all(&bytes).await {
+                                            Ok(_) => {
+                                                if let Some(sender) = oneshot_sender {
+                                                    if let Err(e) = sender.send(true) {
+                                                        log::error!(
+                                                            "Impossible to send oneshot msg: {}",
+                                                            e
+                                                        );
+                                                    }
                                                 }
                                             }
-                                        }
+                                            Err(e) => {
+                                                log::error!(
+                                                    "Impossible to send msg to {}: {}",
+                                                    client.addr(),
+                                                    e.to_string()
+                                                );
+                                                if let Some(sender) = oneshot_sender {
+                                                    if let Err(e) = sender.send(false) {
+                                                        log::error!(
+                                                            "Impossible to send oneshot msg: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        },
                                         Err(e) => {
-                                            log::error!(
-                                                "Impossible to send msg to {}: {}",
-                                                client.addr(),
-                                                e.to_string()
-                                            );
-                                            if let Some(sender) = oneshot_sender {
-                                                if let Err(e) = sender.send(false) {
-                                                    log::error!(
-                                                        "Impossible to send oneshot msg: {}",
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                            break;
+                                            log::error!("Impossible to convert msg to bytes: {e}")
                                         }
+                                    }
+                                }
+                            }
+                            ClientEvent::SendBatch(batch) => {
+                                log::debug!(
+                                    "Sending batch: {:?}",
+                                    batch.iter().map(|m| m.as_json()).collect::<Vec<String>>()
+                                );
+                                let mut bytes: Vec<u8> = Vec::new();
+                                for msg in batch.into_iter().filter(|m| m.is_request()) {
+                                    match msg.as_bytes() {
+                                        Ok(mut b) => bytes.append(&mut b),
+                                        Err(e) => {
+                                            log::error!("Impossible to convert msg to bytes: {e}")
+                                        }
+                                    }
+                                }
+
+                                match write.write_all(&bytes).await {
+                                    Ok(_) => {
+                                        if let Some(sender) = oneshot_sender {
+                                            if let Err(e) = sender.send(true) {
+                                                log::error!(
+                                                    "Impossible to send oneshot msg: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "Impossible to send msg to {}: {}",
+                                            client.addr(),
+                                            e.to_string()
+                                        );
+                                        if let Some(sender) = oneshot_sender {
+                                            if let Err(e) = sender.send(false) {
+                                                log::error!(
+                                                    "Impossible to send oneshot msg: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                        break;
                                     }
                                 }
                             }
@@ -473,10 +524,8 @@ impl Client {
                 }
 
                 let scripts = self.subscriptions.scripts().await;
-                for script in scripts.into_iter() {
-                    if let Err(e) = self._script_subscribe(script, None).await {
-                        log::error!("Impossible to subscribe to script: {e}");
-                    }
+                if let Err(e) = self._batch_script_subscribe(scripts, None).await {
+                    log::error!("Impossible to subscribe to scripts: {e}");
                 }
             }
             Err(err) => {
@@ -565,6 +614,45 @@ impl Client {
                 self.send_client_event(ClientEvent::SendMsg(msg), None)?;
                 Ok(next_id)
             }
+        }
+    }
+
+    pub async fn send_batch_msg(
+        &self,
+        reqs: Vec<Request>,
+        wait: Option<Duration>,
+    ) -> Result<(), Error> {
+        let mut msgs = Vec::new();
+
+        {
+            let mut inventory = self.inventory.lock().await;
+            for req in reqs.into_iter() {
+                let next_id = self.last_id.fetch_add(1, Ordering::SeqCst);
+                let msg = JsonRpcMsg::request(next_id, req.clone());
+                msgs.push(msg);
+                inventory.insert(next_id, req);
+            }
+        }
+
+        match wait {
+            Some(timeout) => {
+                let (tx, rx) = oneshot::channel::<bool>();
+                self.send_client_event(ClientEvent::SendBatch(msgs), Some(tx))?;
+                match time::timeout(Some(timeout), rx).await {
+                    Some(result) => match result {
+                        Ok(val) => {
+                            if val {
+                                Ok(())
+                            } else {
+                                Err(Error::MessageNotSent)
+                            }
+                        }
+                        Err(_) => Err(Error::OneShotRecvError),
+                    },
+                    _ => Err(Error::RecvTimeout),
+                }
+            }
+            None => self.send_client_event(ClientEvent::SendBatch(msgs), None),
         }
     }
 
@@ -667,6 +755,32 @@ impl Client {
         scripts.insert(script.clone());
         drop(scripts);
         self._script_subscribe(script, timeout).await
+    }
+
+    async fn _batch_script_subscribe(
+        &self,
+        script: Vec<Script>,
+        timeout: Option<Duration>,
+    ) -> Result<(), Error> {
+        let reqs = script.into_iter().map(Request::ScriptSubscribe).collect();
+        self.send_batch_msg(reqs, timeout).await?;
+        Ok(())
+    }
+
+    pub async fn batch_script_subscribe(
+        &self,
+        scripts: Vec<Script>,
+        timeout: Option<Duration>,
+    ) -> Result<(), Error> {
+        let mut _scripts = self.subscriptions.scripts.lock().await;
+        for script in scripts.iter() {
+            if _scripts.contains(script) {
+                return Err(Error::AlreadySubscribed(script.clone()));
+            }
+            _scripts.insert(script.clone());
+        }
+        drop(_scripts);
+        self._batch_script_subscribe(scripts, timeout).await
     }
 
     /// Estimates the fee required in Bitcoin per kilobyte to confirm a transaction in number blocks.
