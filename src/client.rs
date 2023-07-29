@@ -851,4 +851,16 @@ impl Client {
             _ => Err(Error::InvalidResponse),
         }
     }
+
+    pub async fn get_history(
+        &self,
+        script: Script,
+        timeout: Option<Duration>,
+    ) -> Result<GetHistoryRes, Error> {
+        let req = Request::GetHistory(script);
+        match self.call(req, timeout).await? {
+            Some(Response::History(history)) => Ok(history),
+            _ => Err(Error::InvalidResponse),
+        }
+    }
 }

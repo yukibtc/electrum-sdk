@@ -28,6 +28,7 @@ pub enum Method {
     BroadcastTx,
     GetTransaction,
     GetBalance,
+    GetHistory,
     Version,
     Ping,
 }
@@ -44,6 +45,7 @@ impl fmt::Display for Method {
             Self::BroadcastTx => write!(f, "blockchain.transaction.broadcast"),
             Self::GetTransaction => write!(f, "blockchain.transaction.get"),
             Self::GetBalance => write!(f, "blockchain.scripthash.get_balance"),
+            Self::GetHistory => write!(f, "blockchain.scripthash.get_history"),
             Self::Version => write!(f, "server.version"),
             Self::Ping => write!(f, "server.ping"),
         }
@@ -63,6 +65,7 @@ impl FromStr for Method {
             "blockchain.transaction.broadcast" => Ok(Self::BroadcastTx),
             "blockchain.transaction.get" => Ok(Self::GetTransaction),
             "blockchain.scripthash.get_balance" => Ok(Self::GetBalance),
+            "blockchain.scripthash.get_history" => Ok(Self::GetHistory),
             "server.version" => Ok(Self::Version),
             "server.ping" => Ok(Self::Ping),
             m => Err(Error::UnknownMethod(m.to_string())),

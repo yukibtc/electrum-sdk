@@ -87,6 +87,7 @@ pub enum Request {
     BroadcastTx(Transaction),
     GetTransaction(Txid),
     GetBalance(Script),
+    GetHistory(Script),
     Version { name: String, version: f32 },
     Ping,
 }
@@ -104,6 +105,7 @@ impl Request {
             Self::BroadcastTx(..) => Method::BroadcastTx,
             Self::GetTransaction(..) => Method::GetTransaction,
             Self::GetBalance(..) => Method::GetBalance,
+            Self::GetHistory(..) => Method::GetHistory,
             Self::Version { .. } => Method::Version,
             Self::Ping => Method::Ping,
         }
@@ -118,11 +120,10 @@ impl Request {
                 count,
             } => vec![Param::Usize(*start_height), Param::Usize(*count)],
             Self::BlockHeaderSubscribe => Vec::new(),
-            Self::ScriptSubscribe(script) => {
-                let script_hash = script.to_electrum_scripthash();
-                vec![Param::String(script_hash.to_hex())]
-            }
-            Self::ScriptUnsubscribe(script) => {
+            Self::ScriptSubscribe(script)
+            | Self::ScriptUnsubscribe(script)
+            | Self::GetBalance(script)
+            | Self::GetHistory(script) => {
                 let script_hash = script.to_electrum_scripthash();
                 vec![Param::String(script_hash.to_hex())]
             }
@@ -132,10 +133,6 @@ impl Request {
                 vec![Param::Bytes(buffer)]
             }
             Self::GetTransaction(txid) => vec![Param::String(txid.to_string())],
-            Self::GetBalance(script) => {
-                let script_hash = script.to_electrum_scripthash();
-                vec![Param::String(script_hash.to_hex())]
-            }
             Self::Version { name, version } => vec![
                 Param::String(name.clone()),
                 Param::String(version.to_string()),
@@ -157,6 +154,7 @@ pub enum Response {
     BroadcastTx(Txid),
     Transaction(Transaction),
     Balance(GetBalanceRes),
+    History(GetHistoryRes),
     Pong,
     Null,
 }
@@ -307,6 +305,10 @@ impl JsonRpcMsg {
                     Request::GetBalance(..) => {
                         let balance: GetBalanceRes = serde_json::from_value(result)?;
                         Ok(Response::Balance(balance))
+                    }
+                    Request::GetHistory(..) => {
+                        let history: GetHistoryRes = serde_json::from_value(result)?;
+                        Ok(Response::History(history))
                     }
                     Request::Ping => Ok(Response::Pong),
                     Request::Version { .. } => Ok(Response::Null),
