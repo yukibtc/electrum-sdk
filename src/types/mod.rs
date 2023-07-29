@@ -86,6 +86,7 @@ pub enum Request {
     EstimateFee { blocks: u8 },
     BroadcastTx(Transaction),
     GetTransaction(Txid),
+    GetBalance(Script),
     Version { name: String, version: f32 },
     Ping,
 }
@@ -102,6 +103,7 @@ impl Request {
             Self::EstimateFee { .. } => Method::EstimateFee,
             Self::BroadcastTx(..) => Method::BroadcastTx,
             Self::GetTransaction(..) => Method::GetTransaction,
+            Self::GetBalance(..) => Method::GetBalance,
             Self::Version { .. } => Method::Version,
             Self::Ping => Method::Ping,
         }
@@ -130,6 +132,10 @@ impl Request {
                 vec![Param::Bytes(buffer)]
             }
             Self::GetTransaction(txid) => vec![Param::String(txid.to_string())],
+            Self::GetBalance(script) => {
+                let script_hash = script.to_electrum_scripthash();
+                vec![Param::String(script_hash.to_hex())]
+            }
             Self::Version { name, version } => vec![
                 Param::String(name.clone()),
                 Param::String(version.to_string()),
@@ -150,6 +156,7 @@ pub enum Response {
     EstimateFee(f64),
     BroadcastTx(Txid),
     Transaction(Transaction),
+    Balance(GetBalanceRes),
     Pong,
     Null,
 }
@@ -297,6 +304,10 @@ impl JsonRpcMsg {
                         let tx: Transaction = deserialize(&data)?;
                         Ok(Response::Transaction(tx))
                     }
+                    Request::GetBalance(..) => {
+                        let balance: GetBalanceRes = serde_json::from_value(result)?;
+                        Ok(Response::Balance(balance))
+                    }
                     Request::Ping => Ok(Response::Pong),
                     Request::Version { .. } => Ok(Response::Null),
                 }
@@ -411,7 +422,7 @@ where
 }
 
 /// Response to a [`script_get_history`](../client/struct.Client.html#method.script_get_history) request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct GetHistoryRes {
     /// Confirmation height of the transaction. 0 if unconfirmed, -1 if unconfirmed while some of
     /// its inputs are unconfirmed too.
@@ -423,7 +434,7 @@ pub struct GetHistoryRes {
 }
 
 /// Response to a [`script_list_unspent`](../client/struct.Client.html#method.script_list_unspent) request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ListUnspentRes {
     /// Confirmation height of the transaction that created this output.
     pub height: usize,
@@ -436,7 +447,7 @@ pub struct ListUnspentRes {
 }
 
 /// Response to a [`server_features`](../client/struct.Client.html#method.server_features) request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ServerFeaturesRes {
     /// Server version reported.
     pub server_version: String,
@@ -469,7 +480,7 @@ pub struct GetHeadersRes {
 }
 
 /// Response to a [`script_get_balance`](../client/struct.Client.html#method.script_get_balance) request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct GetBalanceRes {
     /// Confirmed balance in Satoshis for the address.
     pub confirmed: u64,
@@ -480,7 +491,7 @@ pub struct GetBalanceRes {
 }
 
 /// Response to a [`transaction_get_merkle`](../client/struct.Client.html#method.transaction_get_merkle) request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct GetMerkleRes {
     /// Height of the block that confirmed the transaction
     pub block_height: usize,
@@ -502,7 +513,7 @@ pub struct HeaderNotification {
 }
 
 /// Notification of a new block header with the header encoded as raw bytes
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RawHeaderNotification {
     /// New block height.
     pub height: usize,
@@ -523,7 +534,7 @@ impl TryFrom<RawHeaderNotification> for HeaderNotification {
 }
 
 /// Notification of the new status of a script
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ScriptNotification {
     /// Address that generated this notification.
     pub scripthash: ScriptHash,

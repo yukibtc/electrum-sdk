@@ -3,7 +3,7 @@
 
 //! Electrum Client
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -20,9 +20,8 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::net;
 use crate::types::{
-    GetBalanceRes, GetHeadersRes, GetHistoryRes, GetMerkleRes, HeaderNotification, JsonRpcMsg,
-    ListUnspentRes, Notification, Param, RawHeaderNotification, Request, Response, ScriptStatus,
-    ServerFeaturesRes,
+    GetBalanceRes, GetHeadersRes, GetHistoryRes, GetMerkleRes, JsonRpcMsg, ListUnspentRes,
+    Notification, Request, Response, ScriptStatus, ServerFeaturesRes,
 };
 
 type Message = (ClientEvent, Option<oneshot::Sender<bool>>);
@@ -586,7 +585,7 @@ impl Client {
         Ok(())
     }
 
-    pub async fn send_msg(&self, req: Request, wait: Option<Duration>) -> Result<usize, Error> {
+    async fn send_msg(&self, req: Request, wait: Option<Duration>) -> Result<usize, Error> {
         let next_id = self.last_id.fetch_add(1, Ordering::SeqCst);
         let msg = JsonRpcMsg::request(next_id, req.clone());
 
@@ -620,7 +619,7 @@ impl Client {
         }
     }
 
-    pub async fn send_batch_msg(
+    async fn send_batch_msg(
         &self,
         reqs: Vec<Request>,
         wait: Option<Duration>,
@@ -679,6 +678,15 @@ impl Client {
         .await
         .ok_or(Error::Timeout)
     }
+
+    async fn call(
+        &self,
+        req: Request,
+        timeout: Option<Duration>,
+    ) -> Result<Option<Response>, Error> {
+        let id = self.send_msg(req, timeout).await?;
+        self.get_response(id, timeout).await
+    }
 }
 
 impl Client {
@@ -694,9 +702,7 @@ impl Client {
         timeout: Option<Duration>,
     ) -> Result<BlockHeader, Error> {
         let req = Request::GetBlockHeader { height };
-        let id = self.send_msg(req, timeout).await?;
-        let res = self.get_response(id, timeout).await?;
-        match res {
+        match self.call(req, timeout).await? {
             Some(Response::BlockHeader(header)) => Ok(header),
             _ => Err(Error::InvalidResponse),
         }
@@ -712,9 +718,7 @@ impl Client {
             start_height,
             count,
         };
-        let id = self.send_msg(req, timeout).await?;
-        let res = self.get_response(id, timeout).await?;
-        match res {
+        match self.call(req, timeout).await? {
             Some(Response::BlockHeaders(headers)) => Ok(headers),
             _ => Err(Error::InvalidResponse),
         }
@@ -737,9 +741,7 @@ impl Client {
         timeout: Option<Duration>,
     ) -> Result<Option<ScriptStatus>, Error> {
         let req = Request::ScriptSubscribe(script);
-        let id = self.send_msg(req, timeout).await?;
-        let res = self.get_response(id, timeout).await?;
-        match res {
+        match self.call(req, timeout).await? {
             Some(Response::ScriptStatus(status)) => Ok(status),
             Some(Response::Null) => Ok(None),
             _ => Err(Error::InvalidResponse),
@@ -771,10 +773,9 @@ impl Client {
         }
         scripts.remove(&script);
         drop(scripts);
+
         let req = Request::ScriptUnsubscribe(script);
-        let id = self.send_msg(req, timeout).await?;
-        let res = self.get_response(id, timeout).await?;
-        match res {
+        match self.call(req, timeout).await? {
             Some(Response::ScriptUnsubscribe(status)) => Ok(status),
             _ => Err(Error::InvalidResponse),
         }
@@ -809,9 +810,7 @@ impl Client {
     /// Estimates the fee required in Bitcoin per kilobyte to confirm a transaction in number blocks.
     pub async fn estimate_fee(&self, blocks: u8, timeout: Option<Duration>) -> Result<f64, Error> {
         let req = Request::EstimateFee { blocks };
-        let id = self.send_msg(req, timeout).await?;
-        let res = self.get_response(id, timeout).await?;
-        match res {
+        match self.call(req, timeout).await? {
             Some(Response::EstimateFee(fee)) => Ok(fee),
             _ => Err(Error::InvalidResponse),
         }
@@ -823,9 +822,7 @@ impl Client {
         timeout: Option<Duration>,
     ) -> Result<Txid, Error> {
         let req = Request::BroadcastTx(tx);
-        let id = self.send_msg(req, timeout).await?;
-        let res = self.get_response(id, timeout).await?;
-        match res {
+        match self.call(req, timeout).await? {
             Some(Response::BroadcastTx(txid)) => Ok(txid),
             _ => Err(Error::InvalidResponse),
         }
@@ -837,165 +834,21 @@ impl Client {
         timeout: Option<Duration>,
     ) -> Result<Transaction, Error> {
         let req = Request::GetTransaction(txid);
-        let id = self.send_msg(req, timeout).await?;
-        let res = self.get_response(id, timeout).await?;
-        match res {
+        match self.call(req, timeout).await? {
             Some(Response::Transaction(tx)) => Ok(tx),
             _ => Err(Error::InvalidResponse),
         }
     }
+
+    pub async fn get_balance(
+        &self,
+        script: Script,
+        timeout: Option<Duration>,
+    ) -> Result<GetBalanceRes, Error> {
+        let req = Request::GetBalance(script);
+        match self.call(req, timeout).await? {
+            Some(Response::Balance(balance)) => Ok(balance),
+            _ => Err(Error::InvalidResponse),
+        }
+    }
 }
-
-/*
-
-    /// Batch version of [`transaction_get`](#method.transaction_get).
-    ///
-    /// Takes a list of `txids` and returns a list of transactions.
-    fn batch_transaction_get<'t, I>(&self, txids: I) -> Result<Vec<Transaction>, Error>
-    where
-        I: IntoIterator<Item = &'t Txid> + Clone,
-    {
-        self.batch_transaction_get_raw(txids)?
-            .iter()
-            .map(|s| Ok(deserialize(s)?))
-            .collect()
-    }
-
-    /// Batch version of [`block_header`](#method.block_header).
-    ///
-    /// Takes a list of `heights` of blocks and returns a list of headers.
-    fn batch_block_header<I>(&self, heights: I) -> Result<Vec<BlockHeader>, Error>
-    where
-        I: IntoIterator<Item = u32> + Clone,
-    {
-        self.batch_block_header_raw(heights)?
-            .iter()
-            .map(|s| Ok(deserialize(s)?))
-            .collect()
-    }
-
-    /// Broadcasts a transaction to the network.
-    fn transaction_broadcast(&self, tx: &Transaction) -> Result<Txid, Error> {
-        let buffer: Vec<u8> = serialize(tx);
-        self.transaction_broadcast_raw(&buffer)
-    }
-
-    /// Executes the requested API call returning the raw answer.
-    fn raw_call(
-        &self,
-        method_name: &str,
-        params: impl IntoIterator<Item = Param>,
-    ) -> Result<serde_json::Value, Error>;
-
-    /// Execute a queue of calls stored in a [`Batch`](../batch/struct.Batch.html) struct. Returns
-    /// `Ok()` **only if** all of the calls are successful. The order of the JSON `Value`s returned
-    /// reflects the order in which the calls were made on the `Batch` struct.
-    //fn batch_call(&self, batch: &Batch) -> Result<Vec<serde_json::Value>, Error>;
-
-    /// Subscribes to notifications for new block headers, by sending a `blockchain.headers.subscribe` call and
-    /// returns the current tip as raw bytes instead of deserializing them.
-    fn block_headers_subscribe_raw(&self) -> Result<RawHeaderNotification, Error>;
-
-    /// Tries to pop one queued notification for a new block header that we might have received.
-    /// Returns a the header in raw bytes if a notification is found in the queue, None otherwise.
-    fn block_headers_pop_raw(&self) -> Result<Option<RawHeaderNotification>, Error>;
-
-    /// Gets the raw bytes of block header for height `height`.
-    fn block_header_raw(&self, height: usize) -> Result<Vec<u8>, Error>;
-
-    /// Tries to fetch `count` block headers starting from `start_height`.
-    fn block_headers(&self, start_height: usize, count: usize) -> Result<GetHeadersRes, Error>;
-
-    /// Estimates the fee required in **Bitcoin per kilobyte** to confirm a transaction in `number` blocks.
-    fn estimate_fee(&self, number: usize) -> Result<f64, Error>;
-
-    /// Returns the minimum accepted fee by the server's node in **Bitcoin, not Satoshi**.
-    fn relay_fee(&self) -> Result<f64, Error>;
-
-    /// Subscribes to notifications for activity on a specific *scriptPubKey*.
-    ///
-    /// Returns a [`ScriptStatus`](../types/type.ScriptStatus.html) when successful that represents
-    /// the current status for the requested script.
-    ///
-    /// Returns [`Error::AlreadySubscribed`](../types/enum.Error.html#variant.AlreadySubscribed) if
-    /// already subscribed to the script.
-    fn script_subscribe(&self, script: &Script) -> Result<Option<ScriptStatus>, Error>;
-
-    /// Subscribes to notifications for activity on a specific *scriptPubKey*.
-    ///
-    /// Returns a `bool` with the server response when successful.
-    ///
-    /// Returns [`Error::NotSubscribed`](../types/enum.Error.html#variant.NotSubscribed) if
-    /// not subscribed to the script.
-    fn script_unsubscribe(&self, script: &Script) -> Result<bool, Error>;
-
-    /// Tries to pop one queued notification for a the requested script. Returns `None` if there are no items in the queue.
-    fn script_pop(&self, script: &Script) -> Result<Option<ScriptStatus>, Error>;
-
-    /// Returns the balance for a *scriptPubKey*.
-    fn script_get_balance(&self, script: &Script) -> Result<GetBalanceRes, Error>;
-
-    /// Batch version of [`script_get_balance`](#method.script_get_balance).
-    ///
-    /// Takes a list of scripts and returns a list of balance responses.
-    fn batch_script_get_balance<'s, I>(&self, scripts: I) -> Result<Vec<GetBalanceRes>, Error>
-    where
-        I: IntoIterator<Item = &'s Script> + Clone;
-
-    /// Returns the history for a *scriptPubKey*
-    fn script_get_history(&self, script: &Script) -> Result<Vec<GetHistoryRes>, Error>;
-
-    /// Batch version of [`script_get_history`](#method.script_get_history).
-    ///
-    /// Takes a list of scripts and returns a list of history responses.
-    fn batch_script_get_history<'s, I>(&self, scripts: I) -> Result<Vec<Vec<GetHistoryRes>>, Error>
-    where
-        I: IntoIterator<Item = &'s Script> + Clone;
-
-    /// Returns the list of unspent outputs for a *scriptPubKey*
-    fn script_list_unspent(&self, script: &Script) -> Result<Vec<ListUnspentRes>, Error>;
-
-    /// Batch version of [`script_list_unspent`](#method.script_list_unspent).
-    ///
-    /// Takes a list of scripts and returns a list of a list of utxos.
-    fn batch_script_list_unspent<'s, I>(
-        &self,
-        scripts: I,
-    ) -> Result<Vec<Vec<ListUnspentRes>>, Error>
-    where
-        I: IntoIterator<Item = &'s Script> + Clone;
-
-    /// Gets the raw bytes of a transaction with `txid`. Returns an error if not found.
-    fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>, Error>;
-
-    /// Batch version of [`transaction_get_raw`](#method.transaction_get_raw).
-    ///
-    /// Takes a list of `txids` and returns a list of transactions raw bytes.
-    fn batch_transaction_get_raw<'t, I>(&self, txids: I) -> Result<Vec<Vec<u8>>, Error>
-    where
-        I: IntoIterator<Item = &'t Txid> + Clone;
-
-    /// Batch version of [`block_header_raw`](#method.block_header_raw).
-    ///
-    /// Takes a list of `heights` of blocks and returns a list of block header raw bytes.
-    fn batch_block_header_raw<I>(&self, heights: I) -> Result<Vec<Vec<u8>>, Error>
-    where
-        I: IntoIterator<Item = u32> + Clone;
-
-    /// Batch version of [`estimate_fee`](#method.estimate_fee).
-    ///
-    /// Takes a list of `numbers` of blocks and returns a list of fee required in
-    /// **Satoshis per kilobyte** to confirm a transaction in the given number of blocks.
-    fn batch_estimate_fee<I>(&self, numbers: I) -> Result<Vec<f64>, Error>
-    where
-        I: IntoIterator<Item = usize> + Clone;
-
-    /// Broadcasts the raw bytes of a transaction to the network.
-    fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid, Error>;
-
-    /// Returns the merkle path for the transaction `txid` confirmed in the block at `height`.
-    fn transaction_get_merkle(&self, txid: &Txid, height: usize) -> Result<GetMerkleRes, Error>;
-
-    /// Returns the capabilities of the server.
-    fn server_features(&self) -> Result<ServerFeaturesRes, Error>;
-*/
