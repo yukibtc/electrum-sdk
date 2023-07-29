@@ -5,7 +5,7 @@ use std::convert::TryFrom;
 use std::ops::Deref;
 
 use bitcoin::blockdata::block;
-use bitcoin::consensus::encode::deserialize;
+use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::{BlockHeader, Script, Transaction, Txid};
@@ -84,6 +84,7 @@ pub enum Request {
     GetBlockHeaders { start_height: usize, count: usize },
     BlockHeaderSubscribe,
     EstimateFee { blocks: u8 },
+    BroadcastTx(Transaction),
     GetTransaction(Txid),
     Version { name: String, version: f32 },
     Ping,
@@ -97,6 +98,7 @@ impl Request {
             Self::GetBlockHeaders { .. } => Method::GetBlockHeaders,
             Self::BlockHeaderSubscribe => Method::BlockHeaderSubscribe,
             Self::EstimateFee { .. } => Method::EstimateFee,
+            Self::BroadcastTx(..) => Method::BroadcastTx,
             Self::GetTransaction(..) => Method::GetTransaction,
             Self::Version { .. } => Method::Version,
             Self::Ping => Method::Ping,
@@ -113,6 +115,10 @@ impl Request {
             } => vec![Param::Usize(*start_height), Param::Usize(*count)],
             Self::BlockHeaderSubscribe => Vec::new(),
             Self::EstimateFee { blocks } => vec![Param::U8(*blocks)],
+            Self::BroadcastTx(tx) => {
+                let buffer: Vec<u8> = serialize(tx);
+                vec![Param::Bytes(buffer)]
+            }
             Self::GetTransaction(txid) => vec![Param::String(txid.to_string())],
             Self::Version { name, version } => vec![
                 Param::String(name.clone()),
@@ -130,6 +136,7 @@ pub enum Response {
     BlockHeaders(GetHeadersRes),
     HeaderNotification(HeaderNotification),
     EstimateFee(f64),
+    BroadcastTx(Txid),
     Transaction(Transaction),
     Pong,
     Null,
@@ -259,6 +266,10 @@ impl JsonRpcMsg {
                     Request::EstimateFee { .. } => {
                         let fee: f64 = serde_json::from_value(result)?;
                         Ok(Response::EstimateFee(fee))
+                    }
+                    Request::BroadcastTx(..) => {
+                        let txid: Txid = serde_json::from_value(result)?;
+                        Ok(Response::BroadcastTx(txid))
                     }
                     Request::GetTransaction(..) => {
                         let data: String = serde_json::from_value(result)?;

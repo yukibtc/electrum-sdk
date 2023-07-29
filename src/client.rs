@@ -628,6 +628,20 @@ impl Client {
         }
     }
 
+    pub async fn broadcast_tx(
+        &self,
+        tx: Transaction,
+        timeout: Option<Duration>,
+    ) -> Result<Txid, Error> {
+        let req = Request::BroadcastTx(tx);
+        let id = self.send_msg(req, timeout).await?;
+        let res = self.get_response(id, timeout).await?;
+        match res {
+            Some(Response::BroadcastTx(txid)) => Ok(txid),
+            _ => Err(Error::InvalidResponse),
+        }
+    }
+
     pub async fn get_transaction(
         &self,
         txid: Txid,
