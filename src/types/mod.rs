@@ -82,6 +82,7 @@ pub enum Request {
     GetBlockHeaders { start_height: usize, count: usize },
     BlockHeaderSubscribe,
     ScriptSubscribe(Script),
+    ScriptUnsubscribe(Script),
     EstimateFee { blocks: u8 },
     BroadcastTx(Transaction),
     GetTransaction(Txid),
@@ -97,6 +98,7 @@ impl Request {
             Self::GetBlockHeaders { .. } => Method::GetBlockHeaders,
             Self::BlockHeaderSubscribe => Method::BlockHeaderSubscribe,
             Self::ScriptSubscribe(..) => Method::ScriptSubscribe,
+            Self::ScriptUnsubscribe(..) => Method::ScriptUnsubscribe,
             Self::EstimateFee { .. } => Method::EstimateFee,
             Self::BroadcastTx(..) => Method::BroadcastTx,
             Self::GetTransaction(..) => Method::GetTransaction,
@@ -115,6 +117,10 @@ impl Request {
             } => vec![Param::Usize(*start_height), Param::Usize(*count)],
             Self::BlockHeaderSubscribe => Vec::new(),
             Self::ScriptSubscribe(script) => {
+                let script_hash = script.to_electrum_scripthash();
+                vec![Param::String(script_hash.to_hex())]
+            }
+            Self::ScriptUnsubscribe(script) => {
                 let script_hash = script.to_electrum_scripthash();
                 vec![Param::String(script_hash.to_hex())]
             }
@@ -140,6 +146,7 @@ pub enum Response {
     BlockHeaders(GetHeadersRes),
     HeaderNotification(HeaderNotification),
     ScriptStatus(Option<ScriptStatus>),
+    ScriptUnsubscribe(bool),
     EstimateFee(f64),
     BroadcastTx(Txid),
     Transaction(Transaction),
@@ -271,6 +278,10 @@ impl JsonRpcMsg {
                     Request::ScriptSubscribe(..) => {
                         let status: Option<ScriptStatus> = serde_json::from_value(result)?;
                         Ok(Response::ScriptStatus(status))
+                    }
+                    Request::ScriptUnsubscribe(..) => {
+                        let status: bool = serde_json::from_value(result)?;
+                        Ok(Response::ScriptUnsubscribe(status))
                     }
                     Request::EstimateFee { .. } => {
                         let fee: f64 = serde_json::from_value(result)?;

@@ -50,6 +50,9 @@ pub enum Error {
     /// Already subscribed to script
     #[error("Already subscribed to the notifications of script {0}")]
     AlreadySubscribed(Script),
+    /// Not subscribed to the notifications of an address
+    #[error("Not subscribed to the notifications of script {0}")]
+    NotSubscribed(Script),
 }
 
 /// Client connection status
@@ -755,6 +758,26 @@ impl Client {
         scripts.insert(script.clone());
         drop(scripts);
         self._script_subscribe(script, timeout).await
+    }
+
+    pub async fn script_unsubscribe(
+        &self,
+        script: Script,
+        timeout: Option<Duration>,
+    ) -> Result<bool, Error> {
+        let mut scripts = self.subscriptions.scripts.lock().await;
+        if !scripts.contains(&script) {
+            return Err(Error::NotSubscribed(script));
+        }
+        scripts.remove(&script);
+        drop(scripts);
+        let req = Request::ScriptUnsubscribe(script);
+        let id = self.send_msg(req, timeout).await?;
+        let res = self.get_response(id, timeout).await?;
+        match res {
+            Some(Response::ScriptUnsubscribe(status)) => Ok(status),
+            _ => Err(Error::InvalidResponse),
+        }
     }
 
     async fn _batch_script_subscribe(
