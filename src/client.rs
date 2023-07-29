@@ -63,7 +63,6 @@ pub enum Status {
     Connecting,
     Disconnected,
     Stopped,
-    Terminated,
 }
 
 impl fmt::Display for Status {
@@ -74,7 +73,6 @@ impl fmt::Display for Status {
             Self::Connecting => write!(f, "Connecting"),
             Self::Disconnected => write!(f, "Disconnected"),
             Self::Stopped => write!(f, "Stopped"),
-            Self::Terminated => write!(f, "Terminated"),
         }
     }
 }
@@ -90,8 +88,6 @@ pub enum ClientEvent {
     Close,
     /// Stop
     Stop,
-    /// Completely disconnect
-    Terminate,
 }
 
 /// Client notification
@@ -104,8 +100,6 @@ pub enum ClientNotification {
     Notification(Notification),
     /// Stop
     Stop,
-    /// Shutdown
-    Shutdown,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,7 +128,6 @@ impl ActiveSubscriptions {
 #[derive(Debug, Clone, Default)]
 struct Schedule {
     scheduled_for_stop: Arc<AtomicBool>,
-    scheduled_for_termination: Arc<AtomicBool>,
 }
 
 impl Schedule {
@@ -146,16 +139,6 @@ impl Schedule {
         let _ = self
             .scheduled_for_stop
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |_| Some(value));
-    }
-
-    fn is_scheduled_for_termination(&self) -> bool {
-        self.scheduled_for_termination.load(Ordering::SeqCst)
-    }
-
-    fn schedule_for_termination(&self, value: bool) {
-        let _ =
-            self.scheduled_for_termination
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |_| Some(value));
     }
 }
 
@@ -267,9 +250,8 @@ impl Client {
     /// Connect to electrum server and keep alive connection
     pub async fn connect(&self, wait_for_connection: bool) {
         self.schedule.schedule_for_stop(false);
-        self.schedule.schedule_for_termination(false);
 
-        if let Status::Initialized | Status::Stopped | Status::Terminated = self.status().await {
+        if let Status::Initialized | Status::Stopped = self.status().await {
             if wait_for_connection {
                 self.try_connect().await
             } else {
@@ -282,9 +264,9 @@ impl Client {
                 loop {
                     // Schedule client for termination
                     // Needed to terminate the auto reconnect loop, also if the client is not connected yet.
-                    if client.schedule.is_scheduled_for_termination() {
-                        client.set_status(Status::Terminated).await;
-                        client.schedule.schedule_for_termination(false);
+                    if client.schedule.is_scheduled_for_stop() {
+                        client.set_status(Status::Stopped).await;
+                        client.schedule.schedule_for_stop(false);
                         log::debug!("Auto connect loop terminated [schedule]");
                         break;
                     }
@@ -292,7 +274,7 @@ impl Client {
                     // Check status
                     match client.status().await {
                         Status::Disconnected => client.try_connect().await,
-                        Status::Terminated => {
+                        Status::Stopped => {
                             log::debug!("Auto connect loop terminated");
                             break;
                         }
@@ -513,22 +495,6 @@ impl Client {
                                     break;
                                 }
                             }
-                            ClientEvent::Terminate => {
-                                if client.schedule.is_scheduled_for_termination() {
-                                    let _ = write.shutdown().await;
-                                    client.set_status(Status::Terminated).await;
-                                    client.schedule.schedule_for_termination(false);
-                                    match client.notifications.send(ClientNotification::Shutdown) {
-                                        Ok(_) => log::info!("Completely disconnected from {addr}"),
-                                        Err(e) => {
-                                            log::error!(
-                                                "Impossible to send shutdown notification: {e}"
-                                            )
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
                         }
                     }
 
@@ -569,10 +535,7 @@ impl Client {
     /// Disconnect and set status to 'Disconnected'
     async fn disconnect(&self) -> Result<(), Error> {
         let status = self.status().await;
-        if status.ne(&Status::Disconnected)
-            && status.ne(&Status::Stopped)
-            && status.ne(&Status::Terminated)
-        {
+        if status.ne(&Status::Disconnected) && status.ne(&Status::Stopped) {
             self.send_client_event(ClientEvent::Close, None)?;
         }
         Ok(())
@@ -582,24 +545,8 @@ impl Client {
     pub async fn stop(&self) -> Result<(), Error> {
         self.schedule.schedule_for_stop(true);
         let status = self.status().await;
-        if status.ne(&Status::Disconnected)
-            && status.ne(&Status::Stopped)
-            && status.ne(&Status::Terminated)
-        {
+        if status.ne(&Status::Disconnected) && status.ne(&Status::Stopped) {
             self.send_client_event(ClientEvent::Stop, None)?;
-        }
-        Ok(())
-    }
-
-    /// Disconnect and set status to 'Terminated'
-    pub async fn shutdown(self) -> Result<(), Error> {
-        self.schedule.schedule_for_termination(true);
-        let status = self.status().await;
-        if status.ne(&Status::Disconnected)
-            && status.ne(&Status::Stopped)
-            && status.ne(&Status::Terminated)
-        {
-            self.send_client_event(ClientEvent::Terminate, None)?;
         }
         Ok(())
     }
