@@ -1,6 +1,7 @@
 precommit:
 	cargo fmt --all -- --config format_code_in_doc_comments=true
-	cargo clippy
+	cargo clippy --all
+	cargo test --all
 
 clean:
 	cargo clean
