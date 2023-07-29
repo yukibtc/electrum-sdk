@@ -11,8 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_utility::{thread, time};
-use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::hashes::hex::FromHex;
 use bitcoin::{BlockHeader, Script, Transaction, Txid};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -23,7 +21,7 @@ use tokio::sync::{broadcast, oneshot};
 use crate::net;
 use crate::types::{
     GetBalanceRes, GetHeadersRes, GetHistoryRes, GetMerkleRes, HeaderNotification, JsonRpcMsg,
-    ListUnspentRes, Param, RawHeaderNotification, Request, Response, ScriptStatus,
+    ListUnspentRes, Notification, Param, RawHeaderNotification, Request, Response, ScriptStatus,
     ServerFeaturesRes,
 };
 
@@ -91,11 +89,12 @@ pub enum ClientEvent {
 
 /// Client notification
 #[derive(Debug, Clone)]
-pub enum Notification {
+pub enum ClientNotification {
     Response {
         id: usize,
         response: Response,
     },
+    Notification(Notification),
     /// Stop
     Stop,
     /// Shutdown
@@ -112,7 +111,7 @@ pub struct Client {
     inventory: Arc<Mutex<HashMap<usize, Request>>>,
     sender: Sender<Message>,
     receiver: Arc<Mutex<Receiver<Message>>>,
-    notifications: broadcast::Sender<Notification>,
+    notifications: broadcast::Sender<ClientNotification>,
 }
 
 impl Client {
@@ -122,9 +121,9 @@ impl Client {
         S: Into<String>,
     {
         let (sender, receiver) = mpsc::channel::<Message>(1024);
-        let (tx, _) = broadcast::channel::<Notification>(1024);
+        let (notifications, _) = broadcast::channel::<ClientNotification>(1024);
 
-        Self {
+        let this = Self {
             addr: addr.into(),
             proxy,
             status: Arc::new(Mutex::new(Status::default())),
@@ -132,8 +131,17 @@ impl Client {
             inventory: Arc::new(Mutex::new(HashMap::new())),
             sender,
             receiver: Arc::new(Mutex::new(receiver)),
-            notifications: tx,
-        }
+            notifications,
+        };
+
+        // Needed to keep opened the notifications channel
+        let client = this.clone();
+        thread::spawn(async move {
+            let mut notifications = client.notifications();
+            while notifications.recv().await.is_ok() {}
+        });
+
+        this
     }
     pub fn addr(&self) -> String {
         self.addr.clone()
@@ -143,7 +151,7 @@ impl Client {
         self.proxy
     }
 
-    pub fn notifications(&self) -> broadcast::Receiver<Notification> {
+    pub fn notifications(&self) -> broadcast::Receiver<ClientNotification> {
         self.notifications.subscribe()
     }
 
@@ -327,68 +335,56 @@ impl Client {
                             Ok(size) => {
                                 if size > 0 {
                                     match JsonRpcMsg::from_json(&data) {
-                                        Ok(JsonRpcMsg::Response {
-                                            id, result, error, ..
-                                        }) => {
+                                        Ok(msg) => {
                                             log::trace!("Received response: {data}");
 
-                                            let mut inventory = client.inventory.lock().await;
+                                            match msg {
+                                                JsonRpcMsg::Response { id, .. } => {
+                                                    let mut inventory =
+                                                        client.inventory.lock().await;
+                                                    match inventory.get(&id) {
+                                                        Some(req) => {
+                                                            match msg.to_response(req) {
+                                                                Ok(response) => {
+                                                                    log::debug!("Sending response client notification: {response:?}");
+                                                                    if let Err(e) = client
+                                                                .notifications
+                                                                .send(ClientNotification::Response {
+                                                                    id,
+                                                                    response,
+                                                                }) {
+                                                                    log::error!("Impossible to send client notification: {e}")
+                                                                }
+                                                                },
+                                                                Err(e) => log::error!("Impossible to handle JSONRPC response: {e}")
+                                                            }
+                                                        },
+                                                        None => {
+                                                            log::error!("ID not found in inventory")
+                                                        }
+                                                    }
 
-                                            if let Some(e) = error {
-                                                log::error!("Received error: {e}");
-                                                inventory.remove(&id);
-                                            } else if let Some(result) = result {
-                                                match inventory.get(&id) {
-                                                    Some(req) => match req {
-                                                        Request::GetBlockHeader { .. } => {
-                                                            let data = Vec::<u8>::from_hex(
-                                                                result.as_str().unwrap(),
-                                                            )
-                                                            .unwrap();
-                                                            let header: BlockHeader =
-                                                                deserialize(&data).unwrap();
-                                                            client
-                                                                .notifications
-                                                                .send(Notification::Response {
-                                                                    id,
-                                                                    response: Response::BlockHeader(
-                                                                        header,
-                                                                    ),
-                                                                })
-                                                                .unwrap();
+                                                    inventory.remove(&id);
+                                                }
+                                                JsonRpcMsg::Notification { .. } => {
+                                                    match msg.to_notification() {
+                                                        Ok(notification) => {
+                                                            log::debug!("Sending client notification: {notification:?}");
+                                                            if let Err(e) = client
+                                                        .notifications
+                                                        .send(ClientNotification::Notification(notification)) {
+                                                            log::error!("Impossible to send client notification: {e}")
                                                         }
-                                                        Request::BlockHeaderSubscribe => {
-                                                            let notifications: RawHeaderNotification =
-                                                                serde_json::from_value(result).unwrap();
-                                                            println!("{notifications:?}");
-                                                            // TODO: send global notification
-                                                        }
-                                                        Request::EstimateFee { .. } => {
-                                                            let fee: f64 =
-                                                                serde_json::from_value(result)
-                                                                    .unwrap();
-                                                            client
-                                                                .notifications
-                                                                .send(Notification::Response {
-                                                                    id,
-                                                                    response: Response::EstimateFee(
-                                                                        fee,
-                                                                    ),
-                                                                })
-                                                                .unwrap();
-                                                        }
-                                                        _ => (),
-                                                    },
-                                                    None => {
-                                                        log::error!("ID not found in inventory")
+                                                        },
+                                                        Err(e) => log::error!("Impossible to handle JSONRPC notification: {e}")
                                                     }
                                                 }
+                                                _ => log::warn!("Unexpected msg: {data}"),
                                             }
                                         }
                                         Err(e) => {
                                             log::error!("{e}: {data}");
                                         }
-                                        _ => log::warn!("Received unexpected msg: {data}"),
                                     };
                                 } else {
                                     log::error!("Stream has reached EOF");
@@ -474,7 +470,7 @@ impl Client {
 
         {
             let mut inventory = self.inventory.lock().await;
-            inventory.insert(msg.id(), req);
+            inventory.insert(next_id, req);
         }
 
         match wait {
@@ -510,7 +506,7 @@ impl Client {
         let mut notifications = self.notifications.subscribe();
         time::timeout(timeout, async {
             while let Ok(notification) = notifications.recv().await {
-                if let Notification::Response { id, response } = notification {
+                if let ClientNotification::Response { id, response } = notification {
                     if msg_id == id {
                         return Some(response);
                     }
@@ -525,16 +521,16 @@ impl Client {
 }
 
 impl Client {
-    async fn version(&self) -> Result<(), Error> {
+    /* async fn version(&self) -> Result<(), Error> {
         let req = Request::Version {
             name: String::from("Electrum SDK"),
             version: 1.4,
         };
         self.send_msg(req, Some(Duration::from_secs(30))).await?;
         Ok(())
-    }
+    } */
 
-    async fn ping(&self) -> Result<(), Error> {
+    pub async fn ping(&self) -> Result<(), Error> {
         let req = Request::Ping;
         self.send_msg(req, Some(Duration::from_secs(30))).await?;
         Ok(())
@@ -568,19 +564,6 @@ impl Client {
 }
 
 /*
-
-    /// Subscribes to notifications for new block headers, by sending a `blockchain.headers.subscribe` call.
-    fn block_headers_subscribe(&self) -> Result<HeaderNotification, Error> {
-        self.block_headers_subscribe_raw()?.try_into()
-    }
-
-    /// Tries to pop one queued notification for a new block header that we might have received.
-    /// Returns `None` if there are no items in the queue.
-    fn block_headers_pop(&self) -> Result<Option<HeaderNotification>, Error> {
-        self.block_headers_pop_raw()?
-            .map(|raw| raw.try_into())
-            .transpose()
-    }
 
     /// Gets the transaction with `txid`. Returns an error if not found.
     fn transaction_get(&self, txid: &Txid) -> Result<Transaction, Error> {
@@ -737,8 +720,4 @@ impl Client {
 
     /// Returns the capabilities of the server.
     fn server_features(&self) -> Result<ServerFeaturesRes, Error>;
-
-    /// Pings the server. This method can also be used as a "dummy" call to trigger the processing
-    /// of incoming block header or script notifications.
-    fn ping(&self) -> Result<(), Error>;
 */

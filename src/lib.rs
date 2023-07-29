@@ -9,4 +9,4 @@ mod client;
 mod net;
 pub mod types;
 
-pub use self::client::Client;
+pub use self::client::{Client, ClientNotification};

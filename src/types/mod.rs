@@ -1,6 +1,5 @@
-//! Return types
-//!
-//! This module contains definitions of all the complex data structures that are returned by calls
+// Copyright (c) 2023 Yuki Kishimoto
+// Distributed under the MIT software license
 
 use std::convert::TryFrom;
 use std::ops::Deref;
@@ -13,6 +12,10 @@ use bitcoin::{BlockHeader, Script, Txid};
 use serde::{de, Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+mod method;
+
+pub use self::method::Method;
 
 static JSONRPC_2_0: &str = "2.0";
 
@@ -45,6 +48,15 @@ pub enum Error {
     /// Error during the deserialization of a response from the server
     #[error("Error during the deserialization of a response from the server: {0}")]
     InvalidResponse(serde_json::Value),
+    /// Unknown method
+    #[error("unknown method: {0}")]
+    UnknownMethod(String),
+    /// Unexpected msg
+    #[error("unexpected method: {0}")]
+    UnexpectedMethod(Method),
+    /// Unexpected msg
+    #[error("unexpected msg")]
+    UnexpectedMsg,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +78,7 @@ pub enum Param {
 }
 
 /// Request
-#[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum Request {
     GetBlockHeader { height: usize },
     BlockHeaderSubscribe,
@@ -77,13 +89,13 @@ pub enum Request {
 
 impl Request {
     /// Get req method
-    pub fn method(&self) -> String {
+    pub fn method(&self) -> Method {
         match self {
-            Self::GetBlockHeader { .. } => "blockchain.block.header".to_string(),
-            Self::BlockHeaderSubscribe => "blockchain.headers.subscribe".to_string(),
-            Self::EstimateFee { .. } => "blockchain.estimatefee".to_string(),
-            Self::Version { .. } => "server.version".to_string(),
-            Self::Ping => "server.ping".to_string(),
+            Self::GetBlockHeader { .. } => Method::GetBlockHeader,
+            Self::BlockHeaderSubscribe => Method::BlockHeaderSubscribe,
+            Self::EstimateFee { .. } => Method::EstimateFee,
+            Self::Version { .. } => Method::Version,
+            Self::Ping => Method::Ping,
         }
     }
 
@@ -103,10 +115,19 @@ impl Request {
 }
 
 /// Response
-#[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum Response {
     BlockHeader(BlockHeader),
+    HeaderNotification(HeaderNotification),
     EstimateFee(f64),
+    Pong,
+}
+
+/// Notification
+#[derive(Debug, Clone)]
+pub enum Notification {
+    Headers(Vec<HeaderNotification>),
+    ScriptHash(ScriptNotification),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,7 +140,7 @@ pub enum JsonRpcMsg {
         /// JSON-RPC version
         jsonrpc: String,
         /// Method
-        method: String,
+        method: Method,
         /// params
         params: Vec<Param>,
     },
@@ -132,7 +153,16 @@ pub enum JsonRpcMsg {
         /// Result
         result: Option<Value>,
         /// Reason, if failed
-        error: Option<String>,
+        error: Option<Value>,
+    },
+    /// Notification
+    Notification {
+        /// JSON-RPC version
+        jsonrpc: String,
+        /// Method
+        method: Method,
+        /// Params
+        params: Value,
     },
 }
 
@@ -167,15 +197,73 @@ impl JsonRpcMsg {
         Ok(bytes)
     }
 
-    pub fn id(&self) -> usize {
+    pub fn id(&self) -> Option<usize> {
         match self {
-            Self::Request { id, .. } => *id,
-            Self::Response { id, .. } => *id,
+            Self::Request { id, .. } => Some(*id),
+            Self::Response { id, .. } => Some(*id),
+            Self::Notification { .. } => None,
         }
     }
 
     pub fn is_request(&self) -> bool {
         matches!(self, Self::Request { .. })
+    }
+
+    pub fn is_response(&self) -> bool {
+        matches!(self, Self::Response { .. })
+    }
+
+    pub fn is_notification(&self) -> bool {
+        matches!(self, Self::Notification { .. })
+    }
+
+    pub fn to_response(&self, req: &Request) -> Result<Response, Error> {
+        if let Self::Response { result, error, .. } = self {
+            if let Some(result) = result {
+                match req {
+                    Request::GetBlockHeader { .. } => {
+                        let data = Vec::<u8>::from_hex(result.as_str().unwrap())?;
+                        let header: BlockHeader = deserialize(&data)?;
+                        Ok(Response::BlockHeader(header))
+                    }
+                    Request::BlockHeaderSubscribe => {
+                        let notification: RawHeaderNotification =
+                            serde_json::from_value(result.clone())?;
+                        let notification = HeaderNotification::try_from(notification)?;
+                        Ok(Response::HeaderNotification(notification))
+                    }
+                    Request::EstimateFee { .. } => {
+                        let fee: f64 = serde_json::from_value(result.clone())?;
+                        Ok(Response::EstimateFee(fee))
+                    }
+                    _ => todo!(),
+                }
+            } else if let Some(e) = error {
+                Err(Error::Protocol(e.clone()))
+            } else {
+                Ok(Response::Pong)
+            }
+        } else {
+            Err(Error::UnexpectedMsg)
+        }
+    }
+
+    pub fn to_notification(&self) -> Result<Notification, Error> {
+        if let Self::Notification { method, params, .. } = self {
+            match method {
+                Method::BlockHeaderSubscribe => {
+                    let raw: Vec<RawHeaderNotification> = serde_json::from_value(params.clone())?;
+                    let mut notifications = Vec::new();
+                    for n in raw.into_iter() {
+                        notifications.push(HeaderNotification::try_from(n)?);
+                    }
+                    Ok(Notification::Headers(notifications))
+                }
+                m => Err(Error::UnexpectedMethod(*m)),
+            }
+        } else {
+            Err(Error::UnexpectedMsg)
+        }
     }
 }
 
@@ -258,7 +346,7 @@ where
 }
 
 /// Response to a [`script_get_history`](../client/struct.Client.html#method.script_get_history) request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GetHistoryRes {
     /// Confirmation height of the transaction. 0 if unconfirmed, -1 if unconfirmed while some of
     /// its inputs are unconfirmed too.
@@ -270,7 +358,7 @@ pub struct GetHistoryRes {
 }
 
 /// Response to a [`script_list_unspent`](../client/struct.Client.html#method.script_list_unspent) request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ListUnspentRes {
     /// Confirmation height of the transaction that created this output.
     pub height: usize,
@@ -283,7 +371,7 @@ pub struct ListUnspentRes {
 }
 
 /// Response to a [`server_features`](../client/struct.Client.html#method.server_features) request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerFeaturesRes {
     /// Server version reported.
     pub server_version: String,
@@ -301,7 +389,7 @@ pub struct ServerFeaturesRes {
 }
 
 /// Response to a [`server_features`](../client/struct.Client.html#method.server_features) request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GetHeadersRes {
     /// Maximum number of headers returned in a single response.
     pub max: usize,
@@ -316,7 +404,7 @@ pub struct GetHeadersRes {
 }
 
 /// Response to a [`script_get_balance`](../client/struct.Client.html#method.script_get_balance) request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GetBalanceRes {
     /// Confirmed balance in Satoshis for the address.
     pub confirmed: u64,
@@ -327,7 +415,7 @@ pub struct GetBalanceRes {
 }
 
 /// Response to a [`transaction_get_merkle`](../client/struct.Client.html#method.transaction_get_merkle) request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GetMerkleRes {
     /// Height of the block that confirmed the transaction
     pub block_height: usize,
@@ -339,7 +427,7 @@ pub struct GetMerkleRes {
 }
 
 /// Notification of a new block header
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HeaderNotification {
     /// New block height.
     pub height: usize,
@@ -349,7 +437,7 @@ pub struct HeaderNotification {
 }
 
 /// Notification of a new block header with the header encoded as raw bytes
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RawHeaderNotification {
     /// New block height.
     pub height: usize,
@@ -370,7 +458,7 @@ impl TryFrom<RawHeaderNotification> for HeaderNotification {
 }
 
 /// Notification of the new status of a script
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ScriptNotification {
     /// Address that generated this notification.
     pub scripthash: ScriptHash,
