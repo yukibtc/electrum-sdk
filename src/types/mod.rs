@@ -533,7 +533,7 @@ pub struct GetMerkleRes {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct HeaderNotification {
     /// New block height.
-    pub height: usize,
+    pub height: u32,
     /// Newly added header.
     #[serde(rename = "hex", deserialize_with = "from_hex_header")]
     pub header: block::BlockHeader,
@@ -543,7 +543,7 @@ pub struct HeaderNotification {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RawHeaderNotification {
     /// New block height.
-    pub height: usize,
+    pub height: u32,
     /// Newly added header.
     #[serde(rename = "hex", deserialize_with = "from_hex")]
     pub header: Vec<u8>,
