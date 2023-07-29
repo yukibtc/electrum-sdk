@@ -39,7 +39,7 @@ async fn main() {
 
     let address = Address::from_str("mohjSavDdQYHRYXcS3uS6ttaHP8amyvX78").unwrap();
     let status = client
-        .script_subscribe(address.script_pubkey(), Some(TIMEOUT))
+        .script_subscribe(address, Some(TIMEOUT))
         .await
         .unwrap();
     println!("Status: {status:?}");

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_utility::{thread, time};
-use bitcoin::{BlockHeader, Script, Transaction, Txid};
+use bitcoin::{BlockHeader, Transaction, Txid};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::net;
 use crate::types::{
     GetBalanceRes, GetHeadersRes, GetHistoryRes, HeaderNotification, JsonRpcMsg, Notification,
-    Request, Response, ScriptStatus, ServerFeaturesRes,
+    Request, Response, ScriptHash, ScriptStatus, ServerFeaturesRes, ToElectrumScriptHash,
 };
 
 type Message = (ClientEvent, Option<oneshot::Sender<bool>>);
@@ -48,10 +48,10 @@ pub enum Error {
     InvalidResponse,
     /// Already subscribed to script
     #[error("Already subscribed to the notifications of script {0}")]
-    AlreadySubscribed(Script),
+    AlreadySubscribed(ScriptHash),
     /// Not subscribed to the notifications of an address
     #[error("Not subscribed to the notifications of script {0}")]
-    NotSubscribed(Script),
+    NotSubscribed(ScriptHash),
 }
 
 /// Client connection status
@@ -111,7 +111,7 @@ pub enum ClientNotification {
 #[derive(Debug, Clone, Default)]
 struct ActiveSubscriptions {
     headers: Arc<AtomicBool>,
-    scripts: Arc<Mutex<HashSet<Script>>>,
+    scripts: Arc<Mutex<HashSet<ScriptHash>>>,
 }
 
 impl ActiveSubscriptions {
@@ -125,7 +125,7 @@ impl ActiveSubscriptions {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |_| Some(enabled));
     }
 
-    async fn scripts(&self) -> Vec<Script> {
+    async fn scripts(&self) -> Vec<ScriptHash> {
         let scripts = self.scripts.lock().await;
         scripts.iter().cloned().collect()
     }
@@ -766,12 +766,15 @@ impl Client {
         self._block_headers_subscribe(timeout).await
     }
 
-    async fn _script_subscribe(
+    async fn _script_subscribe<S>(
         &self,
-        script: Script,
+        script: S,
         timeout: Option<Duration>,
-    ) -> Result<Option<ScriptStatus>, Error> {
-        let req = Request::ScriptSubscribe(script);
+    ) -> Result<Option<ScriptStatus>, Error>
+    where
+        S: ToElectrumScriptHash,
+    {
+        let req = Request::ScriptSubscribe(script.to_electrum_scripthash());
         match self.call(req, timeout).await? {
             Some(Response::ScriptStatus(status)) => Ok(status),
             Some(Response::Null) => Ok(None),
@@ -779,25 +782,33 @@ impl Client {
         }
     }
 
-    pub async fn script_subscribe(
+    pub async fn script_subscribe<S>(
         &self,
-        script: Script,
+        script: S,
         timeout: Option<Duration>,
-    ) -> Result<Option<ScriptStatus>, Error> {
+    ) -> Result<Option<ScriptStatus>, Error>
+    where
+        S: ToElectrumScriptHash,
+    {
+        let script = script.to_electrum_scripthash();
         let mut scripts = self.subscriptions.scripts.lock().await;
         if scripts.contains(&script) {
             return Err(Error::AlreadySubscribed(script));
         }
-        scripts.insert(script.clone());
+        scripts.insert(script);
         drop(scripts);
         self._script_subscribe(script, timeout).await
     }
 
-    pub async fn script_unsubscribe(
+    pub async fn script_unsubscribe<S>(
         &self,
-        script: Script,
+        script: S,
         timeout: Option<Duration>,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, Error>
+    where
+        S: ToElectrumScriptHash,
+    {
+        let script = script.to_electrum_scripthash();
         let mut scripts = self.subscriptions.scripts.lock().await;
         if !scripts.contains(&script) {
             return Err(Error::NotSubscribed(script));
@@ -812,27 +823,37 @@ impl Client {
         }
     }
 
-    async fn _batch_script_subscribe(
+    async fn _batch_script_subscribe<S>(
         &self,
-        script: Vec<Script>,
+        scripts: Vec<S>,
         timeout: Option<Duration>,
-    ) -> Result<(), Error> {
-        let reqs = script.into_iter().map(Request::ScriptSubscribe).collect();
+    ) -> Result<(), Error>
+    where
+        S: ToElectrumScriptHash,
+    {
+        let reqs = scripts
+            .into_iter()
+            .map(|s| Request::ScriptSubscribe(s.to_electrum_scripthash()))
+            .collect();
         self.send_batch_msg(reqs, timeout).await?;
         Ok(())
     }
 
-    pub async fn batch_script_subscribe(
+    pub async fn batch_script_subscribe<S>(
         &self,
-        scripts: Vec<Script>,
+        scripts: Vec<S>,
         timeout: Option<Duration>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        S: ToElectrumScriptHash,
+    {
         let mut _scripts = self.subscriptions.scripts.lock().await;
         for script in scripts.iter() {
-            if _scripts.contains(script) {
-                return Err(Error::AlreadySubscribed(script.clone()));
+            let script = script.to_electrum_scripthash();
+            if _scripts.contains(&script) {
+                return Err(Error::AlreadySubscribed(script));
             }
-            _scripts.insert(script.clone());
+            _scripts.insert(script);
         }
         drop(_scripts);
         self._batch_script_subscribe(scripts, timeout).await
@@ -871,24 +892,30 @@ impl Client {
         }
     }
 
-    pub async fn get_balance(
+    pub async fn get_balance<S>(
         &self,
-        script: Script,
+        script: S,
         timeout: Option<Duration>,
-    ) -> Result<GetBalanceRes, Error> {
-        let req = Request::GetBalance(script);
+    ) -> Result<GetBalanceRes, Error>
+    where
+        S: ToElectrumScriptHash,
+    {
+        let req = Request::GetBalance(script.to_electrum_scripthash());
         match self.call(req, timeout).await? {
             Some(Response::Balance(balance)) => Ok(balance),
             _ => Err(Error::InvalidResponse),
         }
     }
 
-    pub async fn get_history(
+    pub async fn get_history<S>(
         &self,
-        script: Script,
+        script: S,
         timeout: Option<Duration>,
-    ) -> Result<GetHistoryRes, Error> {
-        let req = Request::GetHistory(script);
+    ) -> Result<GetHistoryRes, Error>
+    where
+        S: ToElectrumScriptHash,
+    {
+        let req = Request::GetHistory(script.to_electrum_scripthash());
         match self.call(req, timeout).await? {
             Some(Response::History(history)) => Ok(history),
             _ => Err(Error::InvalidResponse),

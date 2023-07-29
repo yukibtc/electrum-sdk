@@ -2,13 +2,14 @@
 // Distributed under the MIT software license
 
 use std::convert::TryFrom;
+use std::fmt;
 use std::ops::Deref;
 
 use bitcoin::blockdata::block;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::hex::{FromHex, ToHex};
 use bitcoin::hashes::{sha256, Hash};
-use bitcoin::{BlockHeader, Script, Transaction, Txid};
+use bitcoin::{Address, BlockHeader, Script, Transaction, Txid};
 use serde::{de, Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -81,13 +82,13 @@ pub enum Request {
     GetBlockHeader { height: usize },
     GetBlockHeaders { start_height: usize, count: usize },
     BlockHeaderSubscribe,
-    ScriptSubscribe(Script),
-    ScriptUnsubscribe(Script),
+    ScriptSubscribe(ScriptHash),
+    ScriptUnsubscribe(ScriptHash),
     EstimateFee { blocks: u8 },
     BroadcastTx(Transaction),
     GetTransaction(Txid),
-    GetBalance(Script),
-    GetHistory(Script),
+    GetBalance(ScriptHash),
+    GetHistory(ScriptHash),
     Features,
     Version { name: String, version: f32 },
     Ping,
@@ -122,11 +123,10 @@ impl Request {
                 count,
             } => vec![Param::Usize(*start_height), Param::Usize(*count)],
             Self::BlockHeaderSubscribe => Vec::new(),
-            Self::ScriptSubscribe(script)
-            | Self::ScriptUnsubscribe(script)
-            | Self::GetBalance(script)
-            | Self::GetHistory(script) => {
-                let script_hash = script.to_electrum_scripthash();
+            Self::ScriptSubscribe(script_hash)
+            | Self::ScriptUnsubscribe(script_hash)
+            | Self::GetBalance(script_hash)
+            | Self::GetHistory(script_hash) => {
                 vec![Param::String(script_hash.to_hex())]
             }
             Self::EstimateFee { blocks } => vec![Param::U8(*blocks)],
@@ -371,6 +371,12 @@ impl From<[u8; 32]> for Hex32Bytes {
     }
 }
 
+impl fmt::Display for Hex32Bytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
 /// Format used by the Electrum server to identify an address. The reverse sha256 hash of the
 /// scriptPubKey. Documented [here](https://electrumx.readthedocs.io/en/latest/protocol-basics.html#script-hashes).
 pub type ScriptHash = Hex32Bytes;
@@ -385,11 +391,23 @@ pub trait ToElectrumScriptHash {
     fn to_electrum_scripthash(&self) -> ScriptHash;
 }
 
+impl ToElectrumScriptHash for Hex32Bytes {
+    fn to_electrum_scripthash(&self) -> ScriptHash {
+        *self
+    }
+}
+
 impl ToElectrumScriptHash for Script {
     fn to_electrum_scripthash(&self) -> ScriptHash {
         let mut result = sha256::Hash::hash(self.as_bytes()).into_inner();
         result.reverse();
         result.into()
+    }
+}
+
+impl ToElectrumScriptHash for Address {
+    fn to_electrum_scripthash(&self) -> ScriptHash {
+        self.script_pubkey().to_electrum_scripthash()
     }
 }
 
