@@ -406,7 +406,8 @@ impl Client {
                                                             match msg.to_response(req) {
                                                                 Ok(response) => {
                                                                     log::debug!("Sending response client notification: {response:?}");
-                                                                    if let Err(e) = client
+                                                                    if response != Response::Null {
+                                                                        if let Err(e) = client
                                                                 .notifications
                                                                 .send(ClientNotification::Response {
                                                                     id,
@@ -414,6 +415,7 @@ impl Client {
                                                                 }) {
                                                                     log::error!("Impossible to send client notification: {e}")
                                                                 }
+                                                                    }
                                                                 },
                                                                 Err(e) => log::error!("Impossible to handle JSONRPC response: {e}")
                                                             }

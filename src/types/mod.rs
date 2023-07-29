@@ -136,7 +136,7 @@ impl Request {
 }
 
 /// Response
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Response {
     BlockHeader(BlockHeader),
     BlockHeaders(GetHeadersRes),
@@ -445,7 +445,7 @@ pub struct ServerFeaturesRes {
 }
 
 /// Response to a [`server_features`](../client/struct.Client.html#method.server_features) request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct GetHeadersRes {
     /// Maximum number of headers returned in a single response.
     pub max: usize,
@@ -483,7 +483,7 @@ pub struct GetMerkleRes {
 }
 
 /// Notification of a new block header
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct HeaderNotification {
     /// New block height.
     pub height: usize,
