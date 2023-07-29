@@ -15,8 +15,8 @@ use bitcoin::{BlockHeader, Script, Transaction, Txid};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::Mutex;
 use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::net;
 use crate::types::{
@@ -162,8 +162,8 @@ impl Schedule {
 /// Electrum Client
 #[derive(Debug, Clone)]
 pub struct Client {
-    addr: String,
-    proxy: Option<SocketAddr>,
+    addr: Arc<RwLock<String>>,
+    proxy: Arc<RwLock<Option<SocketAddr>>>,
     status: Arc<Mutex<Status>>,
     last_id: Arc<AtomicUsize>,
     inventory: Arc<Mutex<HashMap<usize, Request>>>,
@@ -184,8 +184,8 @@ impl Client {
         let (notifications, _) = broadcast::channel::<ClientNotification>(1024);
 
         let this = Self {
-            addr: addr.into(),
-            proxy,
+            addr: Arc::new(RwLock::new(addr.into())),
+            proxy: Arc::new(RwLock::new(proxy)),
             status: Arc::new(Mutex::new(Status::default())),
             last_id: Arc::new(AtomicUsize::new(0)),
             inventory: Arc::new(Mutex::new(HashMap::new())),
@@ -205,16 +205,45 @@ impl Client {
 
         this
     }
-    pub fn addr(&self) -> String {
-        self.addr.clone()
+
+    pub async fn addr(&self) -> String {
+        self.addr.read().await.clone()
     }
 
-    pub fn proxy(&self) -> Option<SocketAddr> {
-        self.proxy
+    pub async fn proxy(&self) -> Option<SocketAddr> {
+        *self.proxy.read().await
     }
 
     pub fn notifications(&self) -> broadcast::Receiver<ClientNotification> {
         self.notifications.subscribe()
+    }
+
+    pub async fn change_address<S>(
+        &self,
+        new_addr: S,
+        new_proxy: Option<SocketAddr>,
+    ) -> Result<(), Error>
+    where
+        S: Into<String>,
+    {
+        self.stop().await?;
+        let mut notifications = self.notifications.subscribe();
+        while let Ok(notification) = notifications.recv().await {
+            if let ClientNotification::Stop = notification {
+                break;
+            }
+        }
+
+        let mut addr = self.addr.write().await;
+        *addr = new_addr.into();
+        drop(addr);
+
+        let mut proxy = self.proxy.write().await;
+        *proxy = new_proxy;
+        drop(proxy);
+
+        self.start().await;
+        Ok(())
     }
 
     pub async fn status(&self) -> Status {
@@ -251,21 +280,12 @@ impl Client {
             let client = self.clone();
             thread::spawn(async move {
                 loop {
-                    log::debug!(
-                        "{} channel capacity: {}",
-                        client.addr(),
-                        client.sender.capacity()
-                    );
-
                     // Schedule client for termination
                     // Needed to terminate the auto reconnect loop, also if the client is not connected yet.
                     if client.schedule.is_scheduled_for_termination() {
                         client.set_status(Status::Terminated).await;
                         client.schedule.schedule_for_termination(false);
-                        log::debug!(
-                            "Auto connect loop terminated for {} [schedule]",
-                            client.addr
-                        );
+                        log::debug!("Auto connect loop terminated [schedule]");
                         break;
                     }
 
@@ -273,7 +293,7 @@ impl Client {
                     match client.status().await {
                         Status::Disconnected => client.try_connect().await,
                         Status::Terminated => {
-                            log::debug!("Auto connect loop terminated for {}", client.addr);
+                            log::debug!("Auto connect loop terminated");
                             break;
                         }
                         _ => (),
@@ -286,19 +306,20 @@ impl Client {
     }
 
     async fn try_connect(&self) {
-        let addr: String = self.addr();
+        let addr: String = self.addr().await;
+        let proxy: Option<SocketAddr> = self.proxy().await;
 
         // Set Status to `Connecting`
         self.set_status(Status::Connecting).await;
         log::debug!("Connecting to {}", addr);
 
         // Connect
-        match net::connect(self.addr(), self.proxy, None).await {
+        match net::connect(addr.clone(), proxy, None).await {
             Ok(stream) => {
                 let (read, mut write) = tokio::io::split(stream);
 
                 self.set_status(Status::Connected).await;
-                log::info!("Connected to {}", addr);
+                log::info!("Connected to {addr}");
 
                 let client = self.clone();
                 let pinger = thread::abortable(async move {
@@ -314,128 +335,7 @@ impl Client {
                 });
 
                 let client = self.clone();
-                thread::spawn(async move {
-                    log::debug!("Client Sender Thread Started");
-                    let mut rx = client.receiver.lock().await;
-                    while let Some((event, oneshot_sender)) = rx.recv().await {
-                        match event {
-                            ClientEvent::SendMsg(msg) => {
-                                if msg.is_request() {
-                                    let json = msg.as_json();
-                                    log::debug!("Sending message {json}");
-                                    match msg.as_bytes() {
-                                        Ok(bytes) => match write.write_all(&bytes).await {
-                                            Ok(_) => {
-                                                if let Some(sender) = oneshot_sender {
-                                                    if let Err(e) = sender.send(true) {
-                                                        log::error!(
-                                                            "Impossible to send oneshot msg: {}",
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log::error!(
-                                                    "Impossible to send msg to {}: {}",
-                                                    client.addr(),
-                                                    e.to_string()
-                                                );
-                                                if let Some(sender) = oneshot_sender {
-                                                    if let Err(e) = sender.send(false) {
-                                                        log::error!(
-                                                            "Impossible to send oneshot msg: {}",
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                                break;
-                                            }
-                                        },
-                                        Err(e) => {
-                                            log::error!("Impossible to convert msg to bytes: {e}")
-                                        }
-                                    }
-                                }
-                            }
-                            ClientEvent::SendBatch(batch) => {
-                                log::debug!(
-                                    "Sending batch: {:?}",
-                                    batch.iter().map(|m| m.as_json()).collect::<Vec<String>>()
-                                );
-                                let mut bytes: Vec<u8> = Vec::new();
-                                for msg in batch.into_iter().filter(|m| m.is_request()) {
-                                    match msg.as_bytes() {
-                                        Ok(mut b) => bytes.append(&mut b),
-                                        Err(e) => {
-                                            log::error!("Impossible to convert msg to bytes: {e}")
-                                        }
-                                    }
-                                }
-
-                                match write.write_all(&bytes).await {
-                                    Ok(_) => {
-                                        if let Some(sender) = oneshot_sender {
-                                            if let Err(e) = sender.send(true) {
-                                                log::error!(
-                                                    "Impossible to send oneshot msg: {}",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Impossible to send msg to {}: {}",
-                                            client.addr(),
-                                            e.to_string()
-                                        );
-                                        if let Some(sender) = oneshot_sender {
-                                            if let Err(e) = sender.send(false) {
-                                                log::error!(
-                                                    "Impossible to send oneshot msg: {}",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            ClientEvent::Close => {
-                                let _ = write.shutdown().await;
-                                client.set_status(Status::Disconnected).await;
-                                log::info!("Disconnected from {}", addr);
-                                break;
-                            }
-                            ClientEvent::Stop => {
-                                if client.schedule.is_scheduled_for_stop() {
-                                    let _ = write.shutdown().await;
-                                    client.set_status(Status::Stopped).await;
-                                    client.schedule.schedule_for_stop(false);
-                                    log::info!("Stopped {}", addr);
-                                    break;
-                                }
-                            }
-                            ClientEvent::Terminate => {
-                                if client.schedule.is_scheduled_for_termination() {
-                                    let _ = write.shutdown().await;
-                                    client.set_status(Status::Terminated).await;
-                                    client.schedule.schedule_for_termination(false);
-                                    log::info!("Completely disconnected from {}", addr);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    pinger.abort();
-
-                    log::debug!("Exited from Client Event Thread");
-                });
-
-                let client = self.clone();
-                thread::spawn(async move {
+                let receiver = thread::abortable(async move {
                     log::debug!("Client Receiver Thread Started");
 
                     let mut reader = BufReader::new(read);
@@ -512,11 +412,130 @@ impl Client {
                         }
                     }
 
-                    log::debug!("Exited from Message Thread of {}", client.addr);
+                    log::debug!("Exited from Message Thread");
 
                     if let Err(err) = client.disconnect().await {
-                        log::error!("Impossible to disconnect {}: {}", client.addr, err);
+                        log::error!("Impossible to disconnect: {}", err);
                     }
+                });
+
+                let client = self.clone();
+                thread::spawn(async move {
+                    log::debug!("Client Sender Thread Started");
+                    let mut rx = client.receiver.lock().await;
+                    while let Some((event, oneshot_sender)) = rx.recv().await {
+                        match event {
+                            ClientEvent::SendMsg(msg) => {
+                                if msg.is_request() {
+                                    let json = msg.as_json();
+                                    log::debug!("Sending message {json}");
+                                    match msg.as_bytes() {
+                                        Ok(bytes) => match write.write_all(&bytes).await {
+                                            Ok(_) => {
+                                                if let Some(sender) = oneshot_sender {
+                                                    if let Err(e) = sender.send(true) {
+                                                        log::error!(
+                                                            "Impossible to send oneshot msg: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::error!("Impossible to send msg: {e}",);
+                                                if let Some(sender) = oneshot_sender {
+                                                    if let Err(e) = sender.send(false) {
+                                                        log::error!(
+                                                            "Impossible to send oneshot msg: {e}"
+                                                        );
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        },
+                                        Err(e) => {
+                                            log::error!("Impossible to convert msg to bytes: {e}")
+                                        }
+                                    }
+                                }
+                            }
+                            ClientEvent::SendBatch(batch) => {
+                                log::debug!(
+                                    "Sending batch: {:?}",
+                                    batch.iter().map(|m| m.as_json()).collect::<Vec<String>>()
+                                );
+                                let mut bytes: Vec<u8> = Vec::new();
+                                for msg in batch.into_iter().filter(|m| m.is_request()) {
+                                    match msg.as_bytes() {
+                                        Ok(mut b) => bytes.append(&mut b),
+                                        Err(e) => {
+                                            log::error!("Impossible to convert msg to bytes: {e}")
+                                        }
+                                    }
+                                }
+
+                                match write.write_all(&bytes).await {
+                                    Ok(_) => {
+                                        if let Some(sender) = oneshot_sender {
+                                            if let Err(e) = sender.send(true) {
+                                                log::error!("Impossible to send oneshot msg: {e}");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!("Impossible to send msg: {e}",);
+                                        if let Some(sender) = oneshot_sender {
+                                            if let Err(e) = sender.send(false) {
+                                                log::error!("Impossible to send oneshot msg: {e}");
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            ClientEvent::Close => {
+                                let _ = write.shutdown().await;
+                                client.set_status(Status::Disconnected).await;
+                                log::info!("Disconnected from {addr}");
+                                break;
+                            }
+                            ClientEvent::Stop => {
+                                if client.schedule.is_scheduled_for_stop() {
+                                    let _ = write.shutdown().await;
+                                    client.set_status(Status::Stopped).await;
+                                    client.schedule.schedule_for_stop(false);
+                                    match client.notifications.send(ClientNotification::Stop) {
+                                        Ok(_) => log::info!("Stopped {addr}"),
+                                        Err(e) => {
+                                            log::error!("Impossible to send stop notification: {e}")
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                            ClientEvent::Terminate => {
+                                if client.schedule.is_scheduled_for_termination() {
+                                    let _ = write.shutdown().await;
+                                    client.set_status(Status::Terminated).await;
+                                    client.schedule.schedule_for_termination(false);
+                                    match client.notifications.send(ClientNotification::Shutdown) {
+                                        Ok(_) => log::info!("Completely disconnected from {addr}"),
+                                        Err(e) => {
+                                            log::error!(
+                                                "Impossible to send shutdown notification: {e}"
+                                            )
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    pinger.abort();
+                    receiver.abort();
+
+                    log::debug!("Exited from Client Event Thread");
                 });
 
                 if self.subscriptions.headers() {
@@ -636,25 +655,29 @@ impl Client {
             }
         }
 
-        match wait {
-            Some(timeout) => {
-                let (tx, rx) = oneshot::channel::<bool>();
-                self.send_client_event(ClientEvent::SendBatch(msgs), Some(tx))?;
-                match time::timeout(Some(timeout), rx).await {
-                    Some(result) => match result {
-                        Ok(val) => {
-                            if val {
-                                Ok(())
-                            } else {
-                                Err(Error::MessageNotSent)
+        if msgs.is_empty() {
+            Ok(())
+        } else {
+            match wait {
+                Some(timeout) => {
+                    let (tx, rx) = oneshot::channel::<bool>();
+                    self.send_client_event(ClientEvent::SendBatch(msgs), Some(tx))?;
+                    match time::timeout(Some(timeout), rx).await {
+                        Some(result) => match result {
+                            Ok(val) => {
+                                if val {
+                                    Ok(())
+                                } else {
+                                    Err(Error::MessageNotSent)
+                                }
                             }
-                        }
-                        Err(_) => Err(Error::OneShotRecvError),
-                    },
-                    _ => Err(Error::RecvTimeout),
+                            Err(_) => Err(Error::OneShotRecvError),
+                        },
+                        _ => Err(Error::RecvTimeout),
+                    }
                 }
+                None => self.send_client_event(ClientEvent::SendBatch(msgs), None),
             }
-            None => self.send_client_event(ClientEvent::SendBatch(msgs), None),
         }
     }
 
