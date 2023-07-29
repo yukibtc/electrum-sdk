@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use async_utility::thread;
-use bitcoin::Txid;
+use bitcoin::{Address, Txid};
 use electrum_sdk::Client;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -14,7 +14,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 async fn main() {
     env_logger::init();
 
-    let client = Client::new("ssl://electrum.blockstream.info:50002", None);
+    let client = Client::new("ssl://blockstream.info:993", None);
 
     client.connect(true).await;
 
@@ -26,7 +26,7 @@ async fn main() {
 
     let tx = client
         .get_transaction(
-            Txid::from_str("8a1fba5a1d49eb7f7f7ec8524e1472dd6b5369df87fe08b2ed55abd7c35a4f43")
+            Txid::from_str("4eacc3a230fb7997f91e437554a048b4bb285e1fcb0e344315da79ec9fe46aaf")
                 .unwrap(),
             Some(TIMEOUT),
         )
@@ -35,6 +35,13 @@ async fn main() {
     println!("{tx:?}");
 
     client.block_headers_subscribe(Some(TIMEOUT)).await.unwrap();
+
+    let address = Address::from_str("mohjSavDdQYHRYXcS3uS6ttaHP8amyvX78").unwrap();
+    let status = client
+        .script_subscribe(address.script_pubkey(), Some(TIMEOUT))
+        .await
+        .unwrap();
+    println!("Status: {status:?}");
 
     /* loop {
         let mut notifications = client.notifications();
