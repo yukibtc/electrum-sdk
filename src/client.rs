@@ -858,7 +858,7 @@ impl Client {
         &self,
         script: S,
         timeout: Option<Duration>,
-    ) -> Result<GetHistoryRes, Error>
+    ) -> Result<Vec<GetHistoryRes>, Error>
     where
         S: ToElectrumScriptHash,
     {

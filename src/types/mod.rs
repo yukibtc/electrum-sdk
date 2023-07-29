@@ -156,7 +156,7 @@ pub enum Response {
     BroadcastTx(Txid),
     Transaction(Transaction),
     Balance(GetBalanceRes),
-    History(GetHistoryRes),
+    History(Vec<GetHistoryRes>),
     Features(ServerFeaturesRes),
     Pong,
     Null,
@@ -310,7 +310,7 @@ impl JsonRpcMsg {
                         Ok(Response::Balance(balance))
                     }
                     Request::GetHistory(..) => {
-                        let history: GetHistoryRes = serde_json::from_value(result)?;
+                        let history: Vec<GetHistoryRes> = serde_json::from_value(result)?;
                         Ok(Response::History(history))
                     }
                     Request::Features => {
