@@ -57,9 +57,6 @@ pub enum Error {
     /// Unexpected msg
     #[error("unexpected msg")]
     UnexpectedMsg,
-    /// Unexpected request
-    #[error("unexpected request")]
-    UnexpectedRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +81,7 @@ pub enum Param {
 #[derive(Debug, Clone)]
 pub enum Request {
     GetBlockHeader { height: usize },
+    GetBlockHeaders { start_height: usize, count: usize },
     BlockHeaderSubscribe,
     EstimateFee { blocks: u8 },
     GetTransaction(Txid),
@@ -96,6 +94,7 @@ impl Request {
     pub fn method(&self) -> Method {
         match self {
             Self::GetBlockHeader { .. } => Method::GetBlockHeader,
+            Self::GetBlockHeaders { .. } => Method::GetBlockHeaders,
             Self::BlockHeaderSubscribe => Method::BlockHeaderSubscribe,
             Self::EstimateFee { .. } => Method::EstimateFee,
             Self::GetTransaction(..) => Method::GetTransaction,
@@ -108,6 +107,10 @@ impl Request {
     pub fn params(&self) -> Vec<Param> {
         match self {
             Self::GetBlockHeader { height } => vec![Param::Usize(*height)],
+            Self::GetBlockHeaders {
+                start_height,
+                count,
+            } => vec![Param::Usize(*start_height), Param::Usize(*count)],
             Self::BlockHeaderSubscribe => Vec::new(),
             Self::EstimateFee { blocks } => vec![Param::U8(*blocks)],
             Self::GetTransaction(txid) => vec![Param::String(txid.to_string())],
@@ -124,10 +127,12 @@ impl Request {
 #[derive(Debug, Clone)]
 pub enum Response {
     BlockHeader(BlockHeader),
+    BlockHeaders(GetHeadersRes),
     HeaderNotification(HeaderNotification),
     EstimateFee(f64),
     Transaction(Transaction),
     Pong,
+    Null,
 }
 
 /// Notification
@@ -226,31 +231,43 @@ impl JsonRpcMsg {
 
     pub fn to_response(&self, req: &Request) -> Result<Response, Error> {
         if let Self::Response { result, error, .. } = self {
-            if let Some(result) = result {
+            if let Some(result) = result.clone() {
                 match req {
                     Request::GetBlockHeader { .. } => {
-                        let data: String = serde_json::from_value(result.clone())?;
+                        let data: String = serde_json::from_value(result)?;
                         let data: Vec<u8> = Vec::<u8>::from_hex(&data)?;
                         let header: BlockHeader = deserialize(&data)?;
                         Ok(Response::BlockHeader(header))
                     }
+                    Request::GetBlockHeaders { .. } => {
+                        let mut deserialized: GetHeadersRes = serde_json::from_value(result)?;
+                        for i in 0..deserialized.count {
+                            let (start, end) = (i * 80, (i + 1) * 80);
+                            deserialized
+                                .headers
+                                .push(deserialize(&deserialized.raw_headers[start..end])?);
+                        }
+                        deserialized.raw_headers.clear();
+
+                        Ok(Response::BlockHeaders(deserialized))
+                    }
                     Request::BlockHeaderSubscribe => {
-                        let notification: RawHeaderNotification =
-                            serde_json::from_value(result.clone())?;
+                        let notification: RawHeaderNotification = serde_json::from_value(result)?;
                         let notification = HeaderNotification::try_from(notification)?;
                         Ok(Response::HeaderNotification(notification))
                     }
                     Request::EstimateFee { .. } => {
-                        let fee: f64 = serde_json::from_value(result.clone())?;
+                        let fee: f64 = serde_json::from_value(result)?;
                         Ok(Response::EstimateFee(fee))
                     }
                     Request::GetTransaction(..) => {
-                        let data: String = serde_json::from_value(result.clone())?;
+                        let data: String = serde_json::from_value(result)?;
                         let data: Vec<u8> = Vec::<u8>::from_hex(&data)?;
                         let tx: Transaction = deserialize(&data)?;
                         Ok(Response::Transaction(tx))
                     }
-                    _ => Err(Error::UnexpectedRequest),
+                    Request::Ping => Ok(Response::Pong),
+                    Request::Version { .. } => Ok(Response::Null),
                 }
             } else if let Some(e) = error {
                 Err(Error::Protocol(e.clone()))

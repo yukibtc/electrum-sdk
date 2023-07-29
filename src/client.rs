@@ -593,6 +593,24 @@ impl Client {
         }
     }
 
+    pub async fn block_headers(
+        &self,
+        start_height: usize,
+        count: usize,
+        timeout: Option<Duration>,
+    ) -> Result<GetHeadersRes, Error> {
+        let req = Request::GetBlockHeaders {
+            start_height,
+            count,
+        };
+        let id = self.send_msg(req, timeout).await?;
+        let res = self.get_response(id, timeout).await?;
+        match res {
+            Some(Response::BlockHeaders(headers)) => Ok(headers),
+            _ => Err(Error::InvalidResponse),
+        }
+    }
+
     pub async fn block_headers_subscribe(&self, timeout: Option<Duration>) -> Result<(), Error> {
         self.subscriptions.set_headers(true);
         let req = Request::BlockHeaderSubscribe;

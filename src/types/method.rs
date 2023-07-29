@@ -20,6 +20,7 @@ pub enum Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Method {
     GetBlockHeader,
+    GetBlockHeaders,
     BlockHeaderSubscribe,
     EstimateFee,
     GetTransaction,
@@ -31,6 +32,7 @@ impl fmt::Display for Method {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::GetBlockHeader => write!(f, "blockchain.block.header"),
+            Self::GetBlockHeaders => write!(f, "blockchain.block.headers"),
             Self::BlockHeaderSubscribe => write!(f, "blockchain.headers.subscribe"),
             Self::EstimateFee => write!(f, "blockchain.estimatefee"),
             Self::GetTransaction => write!(f, "blockchain.transaction.get"),
@@ -45,6 +47,7 @@ impl FromStr for Method {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "blockchain.block.header" => Ok(Self::GetBlockHeader),
+            "blockchain.block.headers" => Ok(Self::GetBlockHeaders),
             "blockchain.headers.subscribe" => Ok(Self::BlockHeaderSubscribe),
             "blockchain.estimatefee" => Ok(Self::EstimateFee),
             "blockchain.transaction.get" => Ok(Self::GetTransaction),
