@@ -18,6 +18,9 @@ async fn main() {
 
     client.connect(true).await;
 
+    let header = client.block_headers_subscribe(Some(TIMEOUT)).await.unwrap();
+    println!("Header: {header:?}");
+
     let header = client.block_header(800_000, Some(TIMEOUT)).await.unwrap();
     println!("{}", header.block_hash());
 
@@ -33,8 +36,6 @@ async fn main() {
         .await
         .unwrap();
     println!("{tx:?}");
-
-    client.block_headers_subscribe(Some(TIMEOUT)).await.unwrap();
 
     let address = Address::from_str("mohjSavDdQYHRYXcS3uS6ttaHP8amyvX78").unwrap();
     let status = client

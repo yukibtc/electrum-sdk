@@ -20,8 +20,8 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::net;
 use crate::types::{
-    GetBalanceRes, GetHeadersRes, GetHistoryRes, JsonRpcMsg, Notification, Request, Response,
-    ScriptStatus, ServerFeaturesRes,
+    GetBalanceRes, GetHeadersRes, GetHistoryRes, HeaderNotification, JsonRpcMsg, Notification,
+    Request, Response, ScriptStatus, ServerFeaturesRes,
 };
 
 type Message = (ClientEvent, Option<oneshot::Sender<bool>>);
@@ -747,13 +747,21 @@ impl Client {
         }
     }
 
-    async fn _block_headers_subscribe(&self, timeout: Option<Duration>) -> Result<(), Error> {
+    async fn _block_headers_subscribe(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<HeaderNotification, Error> {
         let req = Request::BlockHeaderSubscribe;
-        self.send_msg(req, timeout).await?;
-        Ok(())
+        match self.call(req, timeout).await? {
+            Some(Response::HeaderNotification(header)) => Ok(header),
+            _ => Err(Error::InvalidResponse),
+        }
     }
 
-    pub async fn block_headers_subscribe(&self, timeout: Option<Duration>) -> Result<(), Error> {
+    pub async fn block_headers_subscribe(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<HeaderNotification, Error> {
         self.subscriptions.set_headers(true);
         self._block_headers_subscribe(timeout).await
     }
