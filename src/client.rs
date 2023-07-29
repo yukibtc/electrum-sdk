@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -101,6 +101,23 @@ pub enum ClientNotification {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ActiveSubscriptions {
+    headers: Arc<AtomicBool>,
+}
+
+impl ActiveSubscriptions {
+    fn headers(&self) -> bool {
+        self.headers.load(Ordering::SeqCst)
+    }
+
+    fn set_headers(&self, enabled: bool) {
+        let _ = self
+            .headers
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |_| Some(enabled));
+    }
+}
+
 /// Electrum Client
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -109,6 +126,7 @@ pub struct Client {
     status: Arc<Mutex<Status>>,
     last_id: Arc<AtomicUsize>,
     inventory: Arc<Mutex<HashMap<usize, Request>>>,
+    subscriptions: ActiveSubscriptions,
     sender: Sender<Message>,
     receiver: Arc<Mutex<Receiver<Message>>>,
     notifications: broadcast::Sender<ClientNotification>,
@@ -129,6 +147,7 @@ impl Client {
             status: Arc::new(Mutex::new(Status::default())),
             last_id: Arc::new(AtomicUsize::new(0)),
             inventory: Arc::new(Mutex::new(HashMap::new())),
+            subscriptions: ActiveSubscriptions::default(),
             sender,
             receiver: Arc::new(Mutex::new(receiver)),
             notifications,
@@ -405,9 +424,11 @@ impl Client {
                     }
                 });
 
-                /* if let Err(e) = self.version().await {
-                    log::error!("Impossible to send version: {e}");
-                } */
+                if self.subscriptions.headers() {
+                    if let Err(e) = self.block_headers_subscribe(None).await {
+                        log::error!("Impossible to subscribe to headers: {e}");
+                    }
+                }
             }
             Err(err) => {
                 self.set_status(Status::Disconnected).await;
@@ -542,6 +563,7 @@ impl Client {
     }
 
     pub async fn block_headers_subscribe(&self, timeout: Option<Duration>) -> Result<(), Error> {
+        self.subscriptions.set_headers(true);
         let req = Request::BlockHeaderSubscribe;
         self.send_msg(req, timeout).await?;
         Ok(())
@@ -573,11 +595,6 @@ impl Client {
 }
 
 /*
-
-    /// Gets the transaction with `txid`. Returns an error if not found.
-    fn transaction_get(&self, txid: &Txid) -> Result<Transaction, Error> {
-        Ok(deserialize(&self.transaction_get_raw(txid)?)?)
-    }
 
     /// Batch version of [`transaction_get`](#method.transaction_get).
     ///
