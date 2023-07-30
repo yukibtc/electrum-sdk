@@ -345,8 +345,8 @@ impl Client {
                                                         Some(req) => {
                                                             match msg.to_response(req) {
                                                                 Ok(response) => {
-                                                                    log::debug!("Sending response client notification: {response:?}");
                                                                     if response != Response::Null {
+                                                                        log::debug!("Sending response client notification: {response:?}");
                                                                         if let Err(e) = client
                                                                 .notifications
                                                                 .send(ClientNotification::Response {
@@ -594,21 +594,23 @@ impl Client {
         &self,
         reqs: Vec<Request>,
         wait: Option<Duration>,
-    ) -> Result<(), Error> {
-        let mut msgs = Vec::new();
+    ) -> Result<Vec<usize>, Error> {
+        let mut ids: Vec<usize> = Vec::new();
+        let mut msgs: Vec<JsonRpcMsg> = Vec::new();
 
         {
             let mut inventory = self.inventory.lock().await;
             for req in reqs.into_iter() {
                 let next_id = self.last_id.fetch_add(1, Ordering::SeqCst);
                 let msg = JsonRpcMsg::request(next_id, req.clone());
+                ids.push(next_id);
                 msgs.push(msg);
                 inventory.insert(next_id, req);
             }
         }
 
         if msgs.is_empty() {
-            Ok(())
+            Ok(ids)
         } else {
             match wait {
                 Some(timeout) => {
@@ -618,7 +620,7 @@ impl Client {
                         Some(result) => match result {
                             Ok(val) => {
                                 if val {
-                                    Ok(())
+                                    Ok(ids)
                                 } else {
                                     Err(Error::MessageNotSent)
                                 }
@@ -628,7 +630,10 @@ impl Client {
                         _ => Err(Error::RecvTimeout),
                     }
                 }
-                None => self.send_client_event(ClientEvent::SendBatch(msgs), None),
+                None => {
+                    self.send_client_event(ClientEvent::SendBatch(msgs), None)?;
+                    Ok(ids)
+                }
             }
         }
     }
@@ -652,6 +657,33 @@ impl Client {
         })
         .await
         .ok_or(Error::Timeout)
+    }
+
+    async fn get_batch_response(
+        &self,
+        ids: Vec<usize>,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<Response>, Error> {
+        let mut missing_ids: HashSet<usize> = ids.into_iter().collect();
+        let mut responses = Vec::new();
+        let mut notifications = self.notifications.subscribe();
+        time::timeout(timeout, async {
+            while let Ok(notification) = notifications.recv().await {
+                if let ClientNotification::Response { id, response } = notification {
+                    if missing_ids.contains(&id) {
+                        responses.push(response);
+                        missing_ids.remove(&id);
+                    }
+
+                    if missing_ids.is_empty() {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .ok_or(Error::Timeout)?;
+        Ok(responses)
     }
 
     async fn call(
@@ -872,6 +904,29 @@ impl Client {
             Some(Response::History(history)) => Ok(history),
             _ => Err(Error::InvalidResponse),
         }
+    }
+
+    pub async fn batch_get_history<S>(
+        &self,
+        scripts: Vec<S>,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<Vec<GetHistoryRes>>, Error>
+    where
+        S: ToElectrumScriptHash,
+    {
+        let reqs = scripts
+            .into_iter()
+            .map(|s| Request::GetHistory(s.to_electrum_scripthash()))
+            .collect();
+        let ids = self.send_batch_msg(reqs, timeout).await?;
+        let mut res = Vec::new();
+        for r in self.get_batch_response(ids, timeout).await? {
+            match r {
+                Response::History(history) => res.push(history),
+                _ => return Err(Error::InvalidResponse),
+            }
+        }
+        Ok(res)
     }
 
     pub async fn server_features(
